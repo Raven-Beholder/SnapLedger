@@ -91,6 +91,54 @@ struct SnapLedgerTests {
         #expect(decoded.paymentMethods == ["微信支付", "Visa •••• 1234"])
     }
 
+    @Test func shortcutModelJSONCreatesTransaction() throws {
+        let json = """
+        {
+          "transactions": [{
+            "type": "expense",
+            "amount": "28.50",
+            "currency": "CNY",
+            "merchant": "瑞幸咖啡",
+            "category": "餐饮",
+            "date": "2026-11-15 12:42",
+            "paymentMethod": "微信支付",
+            "note": "咖啡",
+            "needsConfirmation": []
+          }]
+        }
+        """
+
+        let transactions = try CloudModelShortcutImport.transactions(from: json, ledger: Ledger())
+        let transaction = try #require(transactions.first)
+        #expect(transaction.amount == Decimal(string: "28.50"))
+        #expect(transaction.currency == .CNY)
+        #expect(transaction.merchant == "瑞幸咖啡")
+        #expect(transaction.category == "餐饮")
+        #expect(transaction.paymentMethod == "微信支付")
+    }
+
+    @Test func shortcutModelJSONRejectsUncertainFields() {
+        let json = """
+        {
+          "transactions": [{
+            "type": "expense",
+            "amount": "28.50",
+            "currency": "CNY",
+            "merchant": "",
+            "category": "其他",
+            "date": "2026-11-15 12:42",
+            "paymentMethod": "",
+            "note": "",
+            "needsConfirmation": ["merchant"]
+          }]
+        }
+        """
+
+        #expect(throws: (any Error).self) {
+            try CloudModelShortcutImport.transactions(from: json, ledger: Ledger())
+        }
+    }
+
     @Test func oldLedgerMigratesPaymentMethodsFromTransactions() throws {
         let json = """
         {

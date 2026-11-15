@@ -63,6 +63,10 @@ struct SettingsView: View {
                 }
             }
 
+            Section("快捷指令云端识别") {
+                CloudShortcutSetupHelp()
+            }
+
             Section("隐私") {
                 Label {
                     Text("OCR 与交易整理在设备端完成。App 不上传、不保存截图、凭证、附件或 OCR 临时文本。")
@@ -180,6 +184,10 @@ private struct MacSettingsContent: View {
                     }
                 }
 
+                MacSettingsSection(title: "快捷指令云端识别", systemImage: "wand.and.stars") {
+                    CloudShortcutSetupHelp()
+                }
+
                 MacSettingsSection(title: "隐私", systemImage: "hand.raised") {
                     Label {
                         Text("OCR 与交易整理在设备端完成。App 不上传、不保存截图、凭证、附件或 OCR 临时文本。")
@@ -220,6 +228,21 @@ private struct MacSettingsSection<Content: View>: View {
     }
 }
 #endif
+
+private struct CloudShortcutSetupHelp: View {
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("在“快捷指令”App 中新建快捷指令，并依次添加：")
+            Text("1. 选择照片或接收截图")
+            Text("2. 获取 SnapLedger 云端解析指令")
+            Text("3. 使用模型，并选择 Cloud 或 Cloud Pro")
+            Text("4. 导入云端模型结果到 SnapLedger")
+            Text("截图由快捷指令选择的模型处理；SnapLedger 只接收并校验模型返回的 JSON。")
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
 
 struct CategoryManagementView: View {
     let model: AppModel

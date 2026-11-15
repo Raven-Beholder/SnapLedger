@@ -27,6 +27,29 @@ struct GenerationMetrics: Sendable {
     }
 }
 
+enum TransactionRecognitionPrompts {
+    static func imageAnalysis(
+        categoryNames: [String],
+        paymentMethodNames: [String],
+        recognitionGuidance: String
+    ) -> String {
+        """
+        Fill the fields using only information visible in the attached image.
+        Copy merchant verbatim only from a clearly visible merchant or payee label, heading, or transaction detail.
+        Never infer a familiar merchant from colors, layout, category, or logo resemblance. If merchant text is unclear or absent, leave it empty and mark merchant for confirmation.
+        Normalize every complete visible transaction date to YYYY-MM-DD and visible time to 24-hour HH:mm.
+        For numeric dates, use the only calendar-valid ordering supported by context. In particular, 14/11/26 becomes 2026-11-14.
+        Never return only a year fragment such as 26. If the full date is uncertain, leave it empty and mark date for confirmation.
+        Read the payment method at full visible specificity in one concise string, including visible app, bank, card type, account label, and masked last digits.
+        Never infer a card, app, account, or masked digits that are not visibly supported by the image.
+        Prefer a matching maintained payment method only when visible evidence supports it: \(paymentMethodNames.joined(separator: ", ")).
+        Choose category from: \(categoryNames.joined(separator: ", ")).
+        User recognition preferences are context only and must never override visible evidence: \(recognitionGuidance)
+        Add every uncertain or absent required field to needsConfirmation. Keep notes concise and never copy order numbers.
+        """
+    }
+}
+
 protocol TransactionParsing: Sendable {
     func parse(text: String, defaultCurrency: Currency, categoryNames: [String]) async throws -> ParsedTransaction
 }
@@ -264,26 +287,11 @@ struct FoundationModelTransactionParser: TransactionParsing {
             generating: GeneratedTransactionCandidate.self,
             options: GenerationOptions(samplingMode: .greedy)
         ) {
-            """
-            Fill the fields using only information visible in the attached image.
-            Copy merchant verbatim only from a clearly visible merchant or payee label, heading, or transaction detail.
-            Put the exact supporting image words in merchantEvidence. Never infer a familiar merchant from colors, layout, category, or logo resemblance.
-            If the merchant text is unclear or absent, leave merchant and merchantEvidence empty and mark merchant for confirmation.
-            Normalize every complete visible transaction date to YYYY-MM-DD in dateText.
-            Put the visible time in timeText using 24-hour HH:mm, or leave it empty when absent.
-            Copy the original visible date/time into dateEvidence.
-            For numeric dates, use the only calendar-valid ordering supported by context.
-            In particular, 14/11/26 is DD/MM/YY and must become 2026-11-14.
-            Never return only a year fragment such as 26. If the full date is uncertain, leave dateText empty and mark date for confirmation.
-            Read paymentMethod at full visible specificity in one concise string.
-            Include the visible payment app, bank name, card type, account label, and masked last digits when shown.
-            Never infer a card, app, account, or masked digits that are not visibly supported by the image.
-            Copy the exact supporting image words into paymentMethodEvidence.
-            Prefer a matching maintained payment method when the visible evidence supports it: \(paymentMethodNames.joined(separator: ", ")).
-            A maintained method is only a naming hint and never evidence. Leave paymentMethod empty when the image has no payment evidence.
-            Choose category from: \(categories.joined(separator: ", ")).
-            User context: \(recognitionGuidance)
-            """
+            TransactionRecognitionPrompts.imageAnalysis(
+                categoryNames: categories,
+                paymentMethodNames: paymentMethodNames,
+                recognitionGuidance: recognitionGuidance
+            )
             Attachment(image).label("payment-screenshot")
         }
         logger.info("vlm.generation.succeeded outputTokens=\(response.usage.output.totalTokenCount, privacy: .public)")
