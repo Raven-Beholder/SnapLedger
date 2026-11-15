@@ -41,6 +41,36 @@ struct SnapLedgerTests {
     @Test func chineseAndISODateParsing() {
         #expect(DateParsing.parse("2026年11月13日 09:42") != nil)
         #expect(DateParsing.parse("2026-11-13T09:42:00+08:00") != nil)
+        #expect(DateParsing.parse("2026/11/13 09:42") != nil)
+        #expect(DateParsing.parse("2026.11.13 09:42") != nil)
+    }
+
+    @Test func missingYearUsesMostRecentNonFutureDate() throws {
+        let now = try #require(ISO8601DateFormatter().date(from: "2026-01-02T10:00:00+08:00"))
+        let result = try #require(DateParsing.resolve("12月31日 23:30", now: now))
+        let components = Calendar.current.dateComponents([.year, .month, .day, .hour, .minute], from: result.date)
+        #expect(components.year == 2025)
+        #expect(components.month == 12)
+        #expect(components.day == 31)
+        #expect(result.precision == .missingYear)
+        #expect(result.requiresConfirmation)
+    }
+
+    @Test func relativeAndTimeOnlyDatesRequireConfirmation() throws {
+        let now = try #require(ISO8601DateFormatter().date(from: "2026-11-14T00:10:00+08:00"))
+        let yesterday = try #require(DateParsing.resolve("昨天 15:39", now: now))
+        let timeOnly = try #require(DateParsing.resolve("23:50", now: now))
+        #expect(yesterday.precision == .relativeDate)
+        #expect(timeOnly.precision == .timeOnly)
+        #expect(yesterday.requiresConfirmation)
+        #expect(timeOnly.requiresConfirmation)
+        #expect(timeOnly.date < now)
+    }
+
+    @Test func invalidOrAbsentDateDoesNotParse() {
+        #expect(DateParsing.resolve("") == nil)
+        #expect(DateParsing.resolve("2026年2月30日 09:42") == nil)
+        #expect(DateParsing.resolve("25:99") == nil)
     }
 
     @Test func ledgerJSONRoundTrip() throws {
@@ -52,6 +82,75 @@ struct SnapLedgerTests {
         #expect(decoded.version == 1)
         #expect(decoded.transactions.first?.merchant == "瑞幸咖啡")
         #expect(decoded.transactions.first?.amount == Decimal(string: "28.50"))
+    }
+
+    @Test func ledgerPersistsMaintainedPaymentMethods() throws {
+        let ledger = Ledger(paymentMethods: ["微信支付", "Visa •••• 1234"])
+        let data = try LedgerCoding.encoder().encode(ledger)
+        let decoded = try LedgerCoding.decoder().decode(Ledger.self, from: data)
+        #expect(decoded.paymentMethods == ["微信支付", "Visa •••• 1234"])
+    }
+
+    @Test func oldLedgerMigratesPaymentMethodsFromTransactions() throws {
+        let json = """
+        {
+          "version" : 1,
+          "defaultCurrency" : "CNY",
+          "transactions" : [{
+            "id" : "00000000-0000-0000-0000-000000000001",
+            "type" : "expense",
+            "amount" : "10",
+            "currency" : "CNY",
+            "merchant" : "测试商户",
+            "category" : "其他",
+            "date" : "2026-11-15T00:00:00Z",
+            "paymentMethod" : "支付宝",
+            "createdAt" : "2026-11-15T00:00:00Z",
+            "updatedAt" : "2026-11-15T00:00:00Z"
+          }],
+          "categories" : [],
+          "recognitionGuidance" : ""
+        }
+        """
+        let ledger = try LedgerCoding.decoder().decode(Ledger.self, from: Data(json.utf8))
+        #expect(ledger.paymentMethods == ["支付宝"])
+    }
+
+    @Test func categoryLookupIgnoresCaseAndWhitespace() throws {
+        let ledger = Ledger(categories: [
+            .init(name: "餐饮", symbolName: "fork.knife", kind: .expense),
+            .init(name: "Old", symbolName: "archivebox.fill", kind: .expense, isArchived: true)
+        ])
+        #expect(ledger.category(named: " 餐饮 ")?.symbolName == "fork.knife")
+        #expect(ledger.category(named: "old")?.symbolName == "archivebox.fill")
+        #expect(ledger.category(named: "未知分类") == nil)
+    }
+
+    @Test func knownCategoryNamesKeepOrderAndAppendHistory() {
+        let ledger = Ledger(
+            transactions: [
+                LedgerTransaction(category: "自定义"),
+                LedgerTransaction(category: "餐饮")
+            ],
+            categories: [
+                LedgerCategory(name: "餐饮", symbolName: "fork.knife", kind: .expense),
+                LedgerCategory(name: "交通", symbolName: "car.fill", kind: .expense)
+            ]
+        )
+        #expect(ledger.knownCategoryNames == ["餐饮", "交通", "自定义"])
+    }
+
+    @Test func mergeKeepsLocalCategoryOrderAndAppendsRemote() {
+        let dining = LedgerCategory(name: "餐饮", symbolName: "fork.knife", kind: .expense)
+        let transit = LedgerCategory(name: "交通", symbolName: "car.fill", kind: .expense)
+        let shopping = LedgerCategory(name: "购物", symbolName: "bag.fill", kind: .expense)
+
+        let merged = Ledger.merged(
+            local: Ledger(categories: [dining, transit]),
+            remote: Ledger(categories: [shopping])
+        )
+
+        #expect(merged.categories.map(\.name) == ["餐饮", "交通", "购物"])
     }
 
     @Test func conflictMergeKeepsNewestUpdatedAt() {
