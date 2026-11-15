@@ -145,12 +145,14 @@ private struct MacCurrencyCard: View {
 }
 #endif
 
+#if DEBUG
 #Preview("统计") {
     @Previewable @State var model = PreviewData.appModel()
     NavigationStack {
         StatisticsView(model: model)
     }
 }
+#endif
 
 private struct CategorySpending: Identifiable {
     var id: String { category }

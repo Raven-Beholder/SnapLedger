@@ -12,3 +12,6 @@ build/
 # Swift Package Manager
 .build/
 SourcePackages/
+
+# Local distribution artifacts
+dist/

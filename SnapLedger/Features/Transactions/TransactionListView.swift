@@ -93,12 +93,14 @@ struct TransactionListView: View {
     }
 }
 
+#if DEBUG
 #Preview("流水列表") {
     @Previewable @State var model = PreviewData.appModel()
     NavigationStack {
         TransactionListView(model: model)
     }
 }
+#endif
 
 struct TransactionMonthGroup: Identifiable {
     let month: Date

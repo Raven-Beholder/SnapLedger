@@ -439,9 +439,11 @@ struct CSVDocument: FileDocument {
     }
 }
 
+#if DEBUG
 #Preview("设置") {
     @Previewable @State var model = PreviewData.appModel()
     NavigationStack {
         SettingsView(model: model)
     }
 }
+#endif

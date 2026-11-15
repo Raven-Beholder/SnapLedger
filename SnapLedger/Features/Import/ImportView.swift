@@ -168,12 +168,14 @@ struct ImportView: View {
     }
 }
 
+#if DEBUG
 #Preview("截图导入") {
     @Previewable @State var model = PreviewData.appModel()
     NavigationStack {
         ImportView(model: model)
     }
 }
+#endif
 
 private struct ModelDiagnosticsView: View {
     let model: AppModel

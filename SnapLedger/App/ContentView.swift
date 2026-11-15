@@ -24,10 +24,12 @@ struct ContentView: View {
     }
 }
 
+#if DEBUG
 #Preview("完整账本") {
     @Previewable @State var model = PreviewData.appModel()
     MainLedgerView(model: model)
 }
+#endif
 
 struct LedgerSelectionView: View {
     let model: AppModel
