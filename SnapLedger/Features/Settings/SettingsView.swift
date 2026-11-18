@@ -6,6 +6,7 @@ struct SettingsView: View {
     @State private var isExporting = false
     @State private var csvDocument = CSVDocument(data: Data())
     @State private var recognitionGuidance = ""
+    @State private var recognitionGuidanceEditorFrame = CGRect.zero
     @FocusState private var isRecognitionGuidanceFocused: Bool
 
     var body: some View {
@@ -14,6 +15,7 @@ struct SettingsView: View {
         MacSettingsContent(
             model: model,
             recognitionGuidance: $recognitionGuidance,
+            isRecognitionGuidanceFocused: $isRecognitionGuidanceFocused,
             onSaveGuidance: saveRecognitionGuidance,
             onChooseLedger: { isOpening = true },
             onExport: prepareExport
@@ -42,9 +44,12 @@ struct SettingsView: View {
             }
 
             Section {
-                IMESafeTextEditor(text: $recognitionGuidance)
+                IMESafeTextEditor(
+                    text: $recognitionGuidance,
+                    isFocused: recognitionGuidanceFocusBinding
+                )
                     .frame(minHeight: 110)
-                    .focused($isRecognitionGuidanceFocused)
+                    .recordRecognitionGuidanceEditorFrame()
                 Button("保存识别偏好") {
                     isRecognitionGuidanceFocused = false
                     Task { await model.updateRecognitionGuidance(recognitionGuidance) }
@@ -78,6 +83,16 @@ struct SettingsView: View {
         }
         #endif
         }
+        .coordinateSpace(name: RecognitionGuidanceCoordinateSpace.name)
+        .onPreferenceChange(RecognitionGuidanceEditorFrameKey.self) {
+            recognitionGuidanceEditorFrame = $0
+        }
+        .simultaneousGesture(
+            SpatialTapGesture().onEnded { event in
+                guard !recognitionGuidanceEditorFrame.contains(event.location) else { return }
+                isRecognitionGuidanceFocused = false
+            }
+        )
         .navigationTitle("设置")
         .task { recognitionGuidance = model.ledger?.recognitionGuidance ?? "" }
         .fileImporter(isPresented: $isOpening, allowedContentTypes: [.json]) { result in
@@ -98,6 +113,13 @@ struct SettingsView: View {
         Task { await model.updateRecognitionGuidance(recognitionGuidance) }
     }
 
+    private var recognitionGuidanceFocusBinding: Binding<Bool> {
+        Binding(
+            get: { isRecognitionGuidanceFocused },
+            set: { isRecognitionGuidanceFocused = $0 }
+        )
+    }
+
     private func prepareExport() {
         csvDocument = CSVDocument(data: CSVExporter().data(for: model.ledger ?? Ledger()))
         isExporting = true
@@ -108,6 +130,7 @@ struct SettingsView: View {
 private struct MacSettingsContent: View {
     let model: AppModel
     @Binding var recognitionGuidance: String
+    var isRecognitionGuidanceFocused: FocusState<Bool>.Binding
     let onSaveGuidance: () -> Void
     let onChooseLedger: () -> Void
     let onExport: () -> Void
@@ -159,6 +182,8 @@ private struct MacSettingsContent: View {
 
                 MacSettingsSection(title: "识别偏好", systemImage: "text.badge.checkmark") {
                     IMESafeTextEditor(text: $recognitionGuidance)
+                        .focused(isRecognitionGuidanceFocused)
+                        .recordRecognitionGuidanceEditorFrame()
                         .font(.body)
                         .scrollContentBackground(.hidden)
                         .padding(10)
@@ -228,6 +253,31 @@ private struct MacSettingsSection<Content: View>: View {
     }
 }
 #endif
+
+private enum RecognitionGuidanceCoordinateSpace {
+    static let name = "recognitionGuidanceSettings"
+}
+
+private struct RecognitionGuidanceEditorFrameKey: PreferenceKey {
+    static let defaultValue = CGRect.zero
+
+    static func reduce(value: inout CGRect, nextValue: () -> CGRect) {
+        value = nextValue()
+    }
+}
+
+private extension View {
+    func recordRecognitionGuidanceEditorFrame() -> some View {
+        background {
+            GeometryReader { proxy in
+                Color.clear.preference(
+                    key: RecognitionGuidanceEditorFrameKey.self,
+                    value: proxy.frame(in: .named(RecognitionGuidanceCoordinateSpace.name))
+                )
+            }
+        }
+    }
+}
 
 private struct CloudShortcutSetupHelp: View {
     var body: some View {

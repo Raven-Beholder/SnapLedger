@@ -7,8 +7,40 @@ struct TransactionRecognitionContext: Sendable {
     let recognitionGuidance: String
 }
 
+enum TransactionRecognitionEvent: Sendable {
+    case started
+    case ocrStarted
+    case ocrCompleted(lineCount: Int, characterCount: Int, duration: TimeInterval, retryPassCount: Int)
+    case excludedStatusBarLines([String])
+    case multimodalStarted
+    case multimodalFallback(errorDomain: String, errorCode: Int)
+    case textFallbackStarted
+    case completed(source: String)
+
+    var message: String {
+        switch self {
+        case .started:
+            "Agent：开始分析图片"
+        case .ocrStarted:
+            "Agent：运行多语言 Vision OCR 预处理"
+        case let .ocrCompleted(lineCount, characterCount, duration, retryPassCount):
+            "Agent：OCR 完成（\(lineCount) 行，\(characterCount) 字符，\(duration.formatted(.number.precision(.fractionLength(2)))) 秒\(retryPassCount > 0 ? "，含 \(retryPassCount) 次语言定向复核" : "")）"
+        case let .excludedStatusBarLines(lines):
+            "Agent：已排除状态栏文字：\(lines.joined(separator: "、"))"
+        case .multimodalStarted:
+            "Agent：将图片与 OCR 文本交给 VLM 融合解析"
+        case let .multimodalFallback(errorDomain, errorCode):
+            "Agent：VLM 失败，转入 OCR 文本回退（\(errorDomain) · \(errorCode)）"
+        case .textFallbackStarted:
+            "Agent：使用 OCR 文本生成结构化交易"
+        case let .completed(source):
+            "Agent：识别完成（\(source)）"
+        }
+    }
+}
+
 struct TransactionRecognitionAgent: Sendable {
-    typealias EventSink = @Sendable (String) async -> Void
+    typealias EventSink = @Sendable (TransactionRecognitionEvent) async -> Void
 
     private let ocr = OCRService()
     private let parser = FoundationModelTransactionParser()
@@ -18,29 +50,30 @@ struct TransactionRecognitionAgent: Sendable {
         context: TransactionRecognitionContext,
         eventSink: @escaping EventSink
     ) async throws -> ParsedTransaction {
-        await eventSink("Agent：开始分析图片")
+        await eventSink(.started)
 
         let ocrStartedAt = Date()
-        await eventSink("Agent：运行多语言 Vision OCR 预处理")
+        await eventSink(.ocrStarted)
         let preparedOCR = try await ocr.prepareForModel(data: imageData)
+        try Task.checkCancellation()
         let ocrDuration = Date().timeIntervalSince(ocrStartedAt)
         let lineCount = preparedOCR.text.split(whereSeparator: \.isNewline).count
-        let retryDescription = preparedOCR.retryPassCount > 0
-            ? "，含 \(preparedOCR.retryPassCount) 次语言定向复核"
-            : ""
         await eventSink(
-            "Agent：OCR 完成（\(lineCount) 行，\(preparedOCR.text.count) 字符，\(formatted(ocrDuration)) 秒\(retryDescription)）"
+            .ocrCompleted(
+                lineCount: lineCount,
+                characterCount: preparedOCR.text.count,
+                duration: ocrDuration,
+                retryPassCount: preparedOCR.retryPassCount
+            )
         )
         if !preparedOCR.excludedStatusBarLines.isEmpty {
-            await eventSink(
-                "Agent：已排除状态栏文字：\(preparedOCR.excludedStatusBarLines.joined(separator: "、"))"
-            )
+            await eventSink(.excludedStatusBarLines(preparedOCR.excludedStatusBarLines))
         }
 
         #if canImport(FoundationModels)
         if #available(iOS 27.0, macOS 27.0, *) {
             do {
-                await eventSink("Agent：将图片与 OCR 文本交给 VLM 融合解析")
+                await eventSink(.multimodalStarted)
                 var parsed = try await parser.parse(
                     imageData: imageData,
                     ocrText: preparedOCR.text,
@@ -51,18 +84,18 @@ struct TransactionRecognitionAgent: Sendable {
                 )
                 parsed.ocrText = preparedOCR.text
                 parsed.excludedStatusBarLines = preparedOCR.excludedStatusBarLines
-                await eventSink("Agent：VLM 融合解析完成")
+                await eventSink(.completed(source: parsed.source))
                 return parsed
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 let nsError = error as NSError
-                await eventSink(
-                    "Agent：VLM 失败，转入 OCR 文本回退（\(nsError.domain) · \(nsError.code)）"
-                )
+                await eventSink(.multimodalFallback(errorDomain: nsError.domain, errorCode: nsError.code))
             }
         }
         #endif
 
-        await eventSink("Agent：使用 OCR 文本生成结构化交易")
+        await eventSink(.textFallbackStarted)
         var parsed = try await parser.parse(
             text: preparedOCR.text,
             defaultCurrency: context.defaultCurrency,
@@ -72,7 +105,7 @@ struct TransactionRecognitionAgent: Sendable {
         )
         parsed.ocrText = preparedOCR.text
         parsed.excludedStatusBarLines = preparedOCR.excludedStatusBarLines
-        await eventSink("Agent：OCR 文本回退完成")
+        await eventSink(.completed(source: parsed.source))
         return parsed
     }
 

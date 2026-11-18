@@ -56,7 +56,14 @@ enum DateParsing {
         case relativeDate
         case timeOnly
 
-        var requiresConfirmation: Bool { self != .dateAndTime }
+        var requiresConfirmation: Bool {
+            switch self {
+            case .dateAndTime, .dateOnly:
+                false
+            case .missingYear, .relativeDate, .timeOnly:
+                true
+            }
+        }
     }
 
     struct Resolution: Equatable, Sendable {

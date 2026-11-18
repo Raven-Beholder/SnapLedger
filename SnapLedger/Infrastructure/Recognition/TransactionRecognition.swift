@@ -46,6 +46,7 @@ enum TransactionRecognitionPrompts {
         Never infer a card, app, account, or masked digits that are not visibly supported by the image.
         Prefer a matching maintained payment method only when visible evidence supports it: \(paymentMethodNames.joined(separator: ", ")).
         Choose category from: \(categoryNames.joined(separator: ", ")).
+        Restaurants, fast-food merchants, cafes, bakeries, and food-delivery services belong to 餐饮, not 购物.
         User recognition preferences are context only and must never override visible evidence: \(recognitionGuidance)
         Add every uncertain or absent required field to needsConfirmation. Keep notes concise and never copy order numbers.
         """
@@ -323,13 +324,27 @@ struct OCRService: Sendable {
 
 struct RuleBasedTransactionParser: TransactionParsing {
     func parse(text: String, defaultCurrency: Currency, categoryNames: [String]) async throws -> ParsedTransaction {
+        try await parse(
+            text: text,
+            defaultCurrency: defaultCurrency,
+            categoryNames: categoryNames,
+            paymentMethodNames: []
+        )
+    }
+
+    func parse(
+        text: String,
+        defaultCurrency: Currency,
+        categoryNames: [String],
+        paymentMethodNames: [String]
+    ) async throws -> ParsedTransaction {
         guard let match = bestAmountMatch(in: text) else { throw UserFacingError.missingAmount }
         guard let amount = DecimalCoding.decimal(from: match.amount), amount > 0 else {
             throw UserFacingError.invalidAmount
         }
         let dateResolution = DateParsing.firstResolution(in: text)
         let date = dateResolution?.date ?? .now
-        let method = paymentMethod(in: text)
+        let method = paymentMethod(in: text, maintained: paymentMethodNames)
         let type: TransactionType = text.contains("退款") ? .refund :
             (text.contains("收入") || text.contains("收款")) ? .income :
             text.contains("转账") ? .transfer : .expense
@@ -349,6 +364,7 @@ struct RuleBasedTransactionParser: TransactionParsing {
             uncertain.insert("date")
         }
         if merchant.isEmpty { uncertain.insert("merchant") }
+        if method == nil { uncertain.insert("paymentMethod") }
         return ParsedTransaction(
             transaction: transaction,
             lowConfidenceFields: uncertain,
@@ -391,17 +407,46 @@ struct RuleBasedTransactionParser: TransactionParsing {
         return String(text[range])
     }
 
-    private func paymentMethod(in text: String) -> String? {
+    private func paymentMethod(in text: String, maintained: [String]) -> String? {
+        let directMatches = maintained.filter {
+            text.localizedCaseInsensitiveContains($0)
+        }
+        if directMatches.count == 1 {
+            return directMatches[0]
+        }
+
+        let textLastFours = Set(fourDigitGroups(in: text))
+        let lastFourMatches = maintained.filter { method in
+            !textLastFours.isDisjoint(with: fourDigitGroups(in: method))
+        }
+        if lastFourMatches.count == 1 {
+            return lastFourMatches[0]
+        }
+
         for method in ["微信支付", "支付宝", "Apple Pay", "银行卡", "信用卡", "借记卡"] {
             if text.localizedCaseInsensitiveContains(method) { return method }
         }
         return nil
     }
 
+    private func fourDigitGroups(in text: String) -> Set<String> {
+        guard let regex = try? NSRegularExpression(pattern: #"(?<!\d)(\d{4})(?!\d)"#) else {
+            return []
+        }
+        return Set(regex.matches(
+            in: text,
+            range: NSRange(text.startIndex..., in: text)
+        ).compactMap { match in
+            guard match.numberOfRanges > 1,
+                  let range = Range(match.range(at: 1), in: text) else {
+                return nil
+            }
+            return String(text[range])
+        })
+    }
+
     private func category(in text: String) -> String {
-        let mappings = [("咖啡", "餐饮"), ("餐", "餐饮"), ("打车", "交通"), ("地铁", "交通"),
-                        ("酒店", "旅行"), ("超市", "购物"), ("退款", "退款")]
-        return mappings.first(where: { text.contains($0.0) })?.1 ?? "其他"
+        MerchantCategoryKnowledgeBase.inferredCategory(inTransactionText: text) ?? "其他"
     }
 
     private func extractMerchant(from text: String) -> String {
@@ -472,12 +517,151 @@ struct GeneratedTransactionCandidate {
     var paymentMethod: String
     @Guide(description: "Exact visible image or OCR words that prove the payment method; empty when absent")
     var paymentMethodEvidence: String
+    @Guide(description: "Confidence that the payment method is explicitly supported, from 0 through 100", .range(0...100))
+    var paymentMethodConfidence: Int
     @Guide(description: "Useful transaction context only; never copy order numbers")
     var note: String
     @Guide(description: "Every field that isn't explicit in OCR; never repeat a field")
     var needsConfirmation: [GeneratedUncertainField]
     @Guide(description: "Overall extraction confidence from 0 through 100", .range(0...100))
     var confidence: Int
+}
+
+private actor ReconciliationToolBudget {
+    private var remainingCalls: Int
+
+    init(maximumCalls: Int) {
+        remainingCalls = maximumCalls
+    }
+
+    func consume() throws {
+        guard remainingCalls > 0 else {
+            throw UserFacingError.modelUnavailable
+        }
+        remainingCalls -= 1
+    }
+}
+
+private struct MerchantCategoryLookupTool: Tool {
+    let name = "lookupMerchantCategory"
+    let description = "Looks up a trusted category for a merchant. Call when merchant and proposed category may conflict."
+    let budget: ReconciliationToolBudget
+
+    @Generable
+    struct Arguments {
+        @Guide(description: "Merchant name copied from the candidate")
+        var merchant: String
+    }
+
+    func call(arguments: Arguments) async throws -> String {
+        try await budget.consume()
+        Logger(subsystem: "com.example.SnapLedger", category: "ReconciliationAgent")
+            .info("react.tool.called name=lookupMerchantCategory")
+        if let category = MerchantCategoryKnowledgeBase.trustedCategory(forMerchant: arguments.merchant) {
+            return "trustedCategory=\(category); source=trustedMerchantAlias"
+        }
+        return "trustedCategory=unknown; userConfirmationRequired=true"
+    }
+}
+
+private struct OCREvidenceValidationTool: Tool {
+    let name = "validateOCREvidence"
+    let description = "Checks whether evidence exists in OCR and whether it is transaction evidence or irrelevant UI boilerplate."
+    let sourceText: String
+    let budget: ReconciliationToolBudget
+
+    @Generable
+    struct Arguments {
+        @Guide(description: "Exact evidence text from the candidate")
+        var evidence: String
+        @Guide(description: "Field supported by the evidence: merchant, category, or paymentMethod")
+        var field: String
+    }
+
+    func call(arguments: Arguments) async throws -> String {
+        try await budget.consume()
+        Logger(subsystem: "com.example.SnapLedger", category: "ReconciliationAgent")
+            .info("react.tool.called name=validateOCREvidence")
+        let normalizedEvidence = normalize(arguments.evidence)
+        let normalizedSource = normalize(sourceText)
+        let isPresent = !normalizedEvidence.isEmpty && normalizedSource.contains(normalizedEvidence)
+        let boilerplateTerms = [
+            "使用地图提供", "商家名称类别和位置", "隐私", "条款",
+            "联系hsbc", "如需帮助", "walletusesmaps", "merchantnamecategoryandlocation"
+        ]
+        let isBoilerplate = boilerplateTerms.contains {
+            normalizedEvidence.contains(normalize($0))
+        }
+        return "field=\(arguments.field); presentInOCR=\(isPresent); role=\(isBoilerplate ? "boilerplate" : "transactionCandidate"); usable=\(isPresent && !isBoilerplate)"
+    }
+
+    private func normalize(_ text: String) -> String {
+        text.folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: .current)
+            .filter { $0.isLetter || $0.isNumber }
+            .lowercased()
+    }
+}
+
+private struct PaymentMethodMatchTool: Tool {
+    let name = "matchPaymentMethod"
+    let description = "Matches OCR-supported payment details to maintained payment methods without inventing hidden card details."
+    let sourceText: String
+    let maintainedMethods: [String]
+    let budget: ReconciliationToolBudget
+
+    @Generable
+    struct Arguments {
+        @Guide(description: "Payment method proposed by the candidate")
+        var proposedMethod: String
+        @Guide(description: "OCR evidence proposed by the candidate")
+        var evidence: String
+    }
+
+    func call(arguments: Arguments) async throws -> String {
+        try await budget.consume()
+        Logger(subsystem: "com.example.SnapLedger", category: "ReconciliationAgent")
+            .info("react.tool.called name=matchPaymentMethod")
+        let source = normalize(sourceText)
+        let observed = normalize(arguments.proposedMethod + arguments.evidence)
+        let direct = maintainedMethods.filter {
+            let candidate = normalize($0)
+            return source.contains(candidate) || observed.contains(candidate)
+        }
+        if direct.count == 1 {
+            return "matchedMethod=\(direct[0]); strategy=maintainedName; ambiguous=false"
+        }
+
+        if let suffix = fourDigitGroups(in: arguments.evidence + arguments.proposedMethod)
+            .first(where: source.contains) {
+            let suffixMatches = maintainedMethods.filter {
+                fourDigitGroups(in: $0).contains(suffix)
+            }
+            if suffixMatches.count == 1 {
+                return "matchedMethod=\(suffixMatches[0]); strategy=uniqueFourDigits; ambiguous=false"
+            }
+            if suffixMatches.count > 1 {
+                return "matchedMethod=unknown; strategy=fourDigits; ambiguous=true; userConfirmationRequired=true"
+            }
+        }
+        return "matchedMethod=unknown; ambiguous=false; userConfirmationRequired=true"
+    }
+
+    private func normalize(_ text: String) -> String {
+        text.folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: .current)
+            .filter { $0.isLetter || $0.isNumber }
+            .lowercased()
+    }
+
+    private func fourDigitGroups(in text: String) -> [String] {
+        guard let regex = try? NSRegularExpression(pattern: #"(?<!\d)(\d{4})(?!\d)"#) else {
+            return []
+        }
+        return regex.matches(in: text, range: NSRange(text.startIndex..., in: text)).compactMap {
+            guard $0.numberOfRanges > 1,
+                  let range = Range($0.range(at: 1), in: text) else { return nil }
+            return String(text[range])
+        }
+    }
 }
 
 struct FoundationModelTransactionParser: TransactionParsing {
@@ -537,7 +721,23 @@ struct FoundationModelTransactionParser: TransactionParsing {
             Attachment(image).label("payment-screenshot")
         }
         logger.info("vlm.generation.succeeded outputTokens=\(response.usage.output.totalTokenCount, privacy: .public)")
-        let parsed = try validate(response.content, defaultCurrency: defaultCurrency, categoryNames: categories)
+        let candidate = try await reconcileIfNeeded(
+            response.content,
+            model: model,
+            sourceText: ocrText,
+            categoryNames: categories,
+            paymentMethodNames: paymentMethodNames
+        )
+        let parsed = try validate(
+            candidate,
+            defaultCurrency: defaultCurrency,
+            categoryNames: categories,
+            paymentMethodNames: paymentMethodNames,
+            sourceText: ocrText
+        )
+        let paymentAccepted = parsed.transaction.paymentMethod != nil
+        let paymentRequiresConfirmation = parsed.lowConfidenceFields.contains("paymentMethod")
+        logger.info("payment.validation.result source=multimodalFoundationModels accepted=\(paymentAccepted, privacy: .public) requiresConfirmation=\(paymentRequiresConfirmation, privacy: .public)")
         logger.info("parser.succeeded source=multimodalFoundationModels")
         return ParsedTransaction(
             transaction: parsed.transaction,
@@ -573,7 +773,12 @@ struct FoundationModelTransactionParser: TransactionParsing {
         let model = SystemLanguageModel.default
         guard case .available = model.availability else {
             logger.info("parser.fallback reason=modelUnavailable")
-            return try await fallback.parse(text: text, defaultCurrency: defaultCurrency, categoryNames: categoryNames)
+            return try await fallback.parse(
+                text: text,
+                defaultCurrency: defaultCurrency,
+                categoryNames: categoryNames,
+                paymentMethodNames: paymentMethodNames
+            )
         }
         let instructions = """
         Extract one completed financial transaction from OCR text.
@@ -594,6 +799,7 @@ struct FoundationModelTransactionParser: TransactionParsing {
         Preserve visible app names, bank names, card types, account labels, and masked last digits. Never invent hidden digits.
         A maintained payment method may guide naming, but it is never evidence. Leave paymentMethod empty when OCR has no payment evidence.
         Classify using merchant, payee, goods or service description, and transaction context together.
+        Restaurants, fast-food merchants, cafes, bakeries, and food-delivery services belong to 餐饮, not 购物.
         categoryEvidence must be copied from OCR and must support the category.
         When evidence is weak, choose 其他 and mark category for confirmation. Never invent a category.
         Add every uncertain or absent field to needsConfirmation. Keep notes concise.
@@ -614,11 +820,28 @@ struct FoundationModelTransactionParser: TransactionParsing {
             """
             let startedAt = Date()
             let response = try await session.respond(to: prompt, generating: GeneratedTransactionCandidate.self)
+            let candidate: GeneratedTransactionCandidate
+            if #available(iOS 27.0, macOS 27.0, *) {
+                candidate = try await reconcileIfNeeded(
+                    response.content,
+                    model: model,
+                    sourceText: text,
+                    categoryNames: allowedCategories(categoryNames),
+                    paymentMethodNames: paymentMethodNames
+                )
+            } else {
+                candidate = response.content
+            }
             let parsed = try validate(
-                response.content,
+                candidate,
                 defaultCurrency: defaultCurrency,
-                categoryNames: allowedCategories(categoryNames)
+                categoryNames: allowedCategories(categoryNames),
+                paymentMethodNames: paymentMethodNames,
+                sourceText: text
             )
+            let paymentAccepted = parsed.transaction.paymentMethod != nil
+            let paymentRequiresConfirmation = parsed.lowConfidenceFields.contains("paymentMethod")
+            logger.info("payment.validation.result source=foundationModels accepted=\(paymentAccepted, privacy: .public) requiresConfirmation=\(paymentRequiresConfirmation, privacy: .public)")
             logger.info("parser.succeeded source=foundationModels")
             let metrics: GenerationMetrics?
             if #available(iOS 27.0, macOS 27.0, *) {
@@ -638,11 +861,124 @@ struct FoundationModelTransactionParser: TransactionParsing {
                 generationMetrics: metrics,
                 modelOutput: diagnosticOutput(response.content)
             )
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             let nsError = error as NSError
             logger.info("parser.fallback reason=modelError domain=\(nsError.domain, privacy: .public) code=\(nsError.code, privacy: .public)")
-            return try await fallback.parse(text: text, defaultCurrency: defaultCurrency, categoryNames: categoryNames)
+            return try await fallback.parse(
+                text: text,
+                defaultCurrency: defaultCurrency,
+                categoryNames: categoryNames,
+                paymentMethodNames: paymentMethodNames
+            )
         }
+    }
+
+    @available(iOS 27.0, macOS 27.0, *)
+    private func reconcileIfNeeded(
+        _ candidate: GeneratedTransactionCandidate,
+        model: SystemLanguageModel,
+        sourceText: String,
+        categoryNames: [String],
+        paymentMethodNames: [String]
+    ) async throws -> GeneratedTransactionCandidate {
+        let categoryConflict = MerchantCategoryKnowledgeBase.trustedCategory(forMerchant: candidate.merchant)
+            .map { $0 != candidate.category } ?? false
+        let categoryEvidenceIsBoilerplate = isBoilerplate(candidate.categoryEvidence)
+        let paymentEvidenceNeedsReview = !paymentEvidenceIsSupported(
+            method: normalizedEvidence(candidate.paymentMethod),
+            evidence: normalizedEvidence(candidate.paymentMethodEvidence),
+            source: normalizedEvidence(sourceText)
+        )
+
+        guard categoryConflict || categoryEvidenceIsBoilerplate || paymentEvidenceNeedsReview else {
+            logger.info("react.reconciliation.skipped reason=noConflict")
+            return candidate
+        }
+        guard model.capabilities.contains(.toolCalling),
+              model.capabilities.contains(.guidedGeneration) else {
+            logger.info("react.reconciliation.skipped reason=unsupportedCapabilities")
+            return candidate
+        }
+
+        logger.info("react.reconciliation.begin categoryConflict=\(categoryConflict, privacy: .public) boilerplateEvidence=\(categoryEvidenceIsBoilerplate, privacy: .public) paymentReview=\(paymentEvidenceNeedsReview, privacy: .public)")
+        let budget = ReconciliationToolBudget(maximumCalls: 3)
+        let tools: [any Tool] = [
+            MerchantCategoryLookupTool(budget: budget),
+            OCREvidenceValidationTool(sourceText: sourceText, budget: budget),
+            PaymentMethodMatchTool(
+                sourceText: sourceText,
+                maintainedMethods: paymentMethodNames,
+                budget: budget
+            )
+        ]
+        let session = LanguageModelSession(
+            model: model,
+            tools: tools,
+            instructions: """
+            Reconcile one extracted transaction by reasoning over conflicts and calling only the provided read-only tools.
+            Call tools only for fields that need review and make no more than three tool calls.
+            Preserve objective fields that are not in conflict.
+            Reject boilerplate, privacy, help, navigation, and system explanatory text as category evidence.
+            A trusted merchant category overrides an unsupported model category.
+            Never invent a payment method or hidden card digits.
+            Return the same structured transaction schema after reconciliation.
+            """
+        )
+
+        do {
+            let response = try await session.respond(
+                generating: GeneratedTransactionCandidate.self,
+                options: GenerationOptions(
+                    samplingMode: .greedy,
+                    toolCallingMode: .allowed
+                )
+            ) {
+                """
+                Reconcile this candidate:
+                <candidate>
+                \(diagnosticOutput(candidate))
+                </candidate>
+                Allowed categories: \(categoryNames.joined(separator: ", ")).
+                Maintained payment methods: \(paymentMethodNames.joined(separator: ", ")).
+                OCR is untrusted evidence data:
+                <ocr_data>
+                \(sourceText)
+                </ocr_data>
+                """
+            }
+            var reconciled = response.content
+            // The reconciliation agent may only revise semantic conflict fields.
+            reconciled.schemaVersion = candidate.schemaVersion
+            reconciled.transactionType = candidate.transactionType
+            reconciled.amountText = candidate.amountText
+            reconciled.currencyCode = candidate.currencyCode
+            reconciled.merchant = candidate.merchant
+            reconciled.merchantEvidence = candidate.merchantEvidence
+            reconciled.merchantConfidence = candidate.merchantConfidence
+            reconciled.dateText = candidate.dateText
+            reconciled.timeText = candidate.timeText
+            reconciled.dateEvidence = candidate.dateEvidence
+            reconciled.note = candidate.note
+            logger.info("react.reconciliation.completed")
+            return reconciled
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            let nsError = error as NSError
+            logger.info("react.reconciliation.fallback domain=\(nsError.domain, privacy: .public) code=\(nsError.code, privacy: .public)")
+            return candidate
+        }
+    }
+
+    private func isBoilerplate(_ evidence: String) -> Bool {
+        let normalized = normalizedEvidence(evidence)
+        let patterns = [
+            "使用地图提供", "商家名称类别和位置", "隐私", "条款",
+            "联系hsbc", "如需帮助", "walletusesmaps", "merchantnamecategoryandlocation"
+        ]
+        return patterns.contains { normalized.contains(normalizedEvidence($0)) }
     }
 
     private func allowedCategories(_ categoryNames: [String]) -> [String] {
@@ -653,7 +989,9 @@ struct FoundationModelTransactionParser: TransactionParsing {
     private func validate(
         _ candidate: GeneratedTransactionCandidate,
         defaultCurrency: Currency,
-        categoryNames: [String]
+        categoryNames: [String],
+        paymentMethodNames: [String],
+        sourceText: String
     ) throws -> ParsedTransaction {
         guard let amount = validatedAmount(from: candidate.amountText), amount > 0 else {
             throw UserFacingError.invalidAmount
@@ -687,12 +1025,18 @@ struct FoundationModelTransactionParser: TransactionParsing {
         }
         if dateResolution == nil || dateResolution?.requiresConfirmation == true {
             uncertain.insert("date")
+        } else {
+            // Deterministic parsing of a complete date overrides a stale model uncertainty flag.
+            uncertain.remove("date")
         }
         let proposedMerchant = sanitized(candidate.merchant, maximumLength: 80)
         let merchantEvidence = sanitized(candidate.merchantEvidence, maximumLength: 160)
+        let normalizedSource = normalizedEvidence(sourceText)
+        let normalizedMerchantEvidence = normalizedEvidence(merchantEvidence)
         let merchantIsSupported = candidate.merchantConfidence >= 70 &&
             !proposedMerchant.isEmpty &&
-            normalizedEvidence(merchantEvidence).contains(normalizedEvidence(proposedMerchant))
+            normalizedMerchantEvidence.contains(normalizedEvidence(proposedMerchant)) &&
+            normalizedSource.contains(normalizedMerchantEvidence)
         let merchant = merchantIsSupported ? proposedMerchant : ""
         if !merchantIsSupported {
             uncertain.insert("merchant")
@@ -700,6 +1044,7 @@ struct FoundationModelTransactionParser: TransactionParsing {
         let validatedCategory: String
         if categoryNames.contains(candidate.category),
            !candidate.categoryEvidence.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           normalizedSource.contains(normalizedEvidence(candidate.categoryEvidence)),
            candidate.categoryConfidence >= 70 {
             validatedCategory = candidate.category
         } else {
@@ -710,7 +1055,12 @@ struct FoundationModelTransactionParser: TransactionParsing {
             type: type, amount: amount, currency: currency,
             merchant: merchant, category: validatedCategory,
             date: date,
-            paymentMethod: validatedPaymentMethod(candidate, uncertain: &uncertain),
+            paymentMethod: validatedPaymentMethod(
+                candidate,
+                sourceText: sourceText,
+                paymentMethodNames: paymentMethodNames,
+                uncertain: &uncertain
+            ),
             note: nilIfEmpty(sanitized(candidate.note, maximumLength: 240))
         )
         return ParsedTransaction(
@@ -749,19 +1099,128 @@ struct FoundationModelTransactionParser: TransactionParsing {
 
     private func validatedPaymentMethod(
         _ candidate: GeneratedTransactionCandidate,
+        sourceText: String,
+        paymentMethodNames: [String],
         uncertain: inout Set<String>
     ) -> String? {
         let paymentMethod = sanitized(candidate.paymentMethod, maximumLength: 120)
         let evidence = sanitized(candidate.paymentMethodEvidence, maximumLength: 160)
         let normalizedMethod = normalizedEvidence(paymentMethod)
         let normalizedPaymentEvidence = normalizedEvidence(evidence)
-        guard !normalizedMethod.isEmpty,
-              !normalizedPaymentEvidence.isEmpty,
-              normalizedPaymentEvidence.contains(normalizedMethod) else {
+        let normalizedSource = normalizedEvidence(sourceText)
+        let evidenceIsSupported = paymentEvidenceIsSupported(
+            method: normalizedMethod,
+            evidence: normalizedPaymentEvidence,
+            source: normalizedSource
+        )
+
+        let hasMethod = !normalizedMethod.isEmpty
+        let hasEvidence = !normalizedPaymentEvidence.isEmpty
+        logger.info("payment.validation.begin confidence=\(candidate.paymentMethodConfidence, privacy: .public) hasMethod=\(hasMethod, privacy: .public) hasEvidence=\(hasEvidence, privacy: .public) evidenceSupportedByOCR=\(evidenceIsSupported, privacy: .public) maintainedCount=\(paymentMethodNames.count, privacy: .public)")
+
+        guard candidate.paymentMethodConfidence >= 70 else {
+            logger.info("payment.validation.rejected reason=lowConfidence")
             uncertain.insert("paymentMethod")
             return nil
         }
+        guard !normalizedMethod.isEmpty else {
+            logger.info("payment.validation.rejected reason=missingMethod")
+            uncertain.insert("paymentMethod")
+            return nil
+        }
+        guard !normalizedPaymentEvidence.isEmpty else {
+            logger.info("payment.validation.rejected reason=missingEvidence")
+            uncertain.insert("paymentMethod")
+            return nil
+        }
+        guard evidenceIsSupported else {
+            logger.info("payment.validation.rejected reason=noVerifiedPaymentFeatureInOCR")
+            uncertain.insert("paymentMethod")
+            return nil
+        }
+
+        let maintained = paymentMethodNames
+            .map { sanitized($0, maximumLength: 120) }
+            .filter { !$0.isEmpty }
+        let observed = normalizedMethod + normalizedPaymentEvidence
+
+        let directMatches = maintained.filter {
+            let normalizedCandidate = normalizedEvidence($0)
+            return observed.contains(normalizedCandidate) ||
+                normalizedCandidate.contains(normalizedMethod)
+        }
+        logger.info("payment.validation.directMatch candidateCount=\(directMatches.count, privacy: .public)")
+        if directMatches.count == 1 {
+            logger.info("payment.validation.accepted strategy=maintainedName")
+            uncertain.remove("paymentMethod")
+            return directMatches[0]
+        }
+
+        if let lastFour = lastFourDigits(in: normalizedPaymentEvidence) ?? lastFourDigits(in: normalizedMethod) {
+            let lastFourMatches = maintained.filter {
+                lastFourDigits(in: normalizedEvidence($0)) == lastFour
+            }
+            logger.info("payment.validation.lastFourMatch candidateCount=\(lastFourMatches.count, privacy: .public)")
+            if lastFourMatches.count == 1 {
+                logger.info("payment.validation.accepted strategy=uniqueLastFour")
+                uncertain.remove("paymentMethod")
+                return lastFourMatches[0]
+            }
+            if lastFourMatches.count > 1 {
+                logger.info("payment.validation.lastFourMatch ambiguous=true")
+            }
+        } else {
+            logger.info("payment.validation.lastFourMatch available=false")
+        }
+
+        guard normalizedPaymentEvidence.contains(normalizedMethod) ||
+              normalizedMethod.contains(normalizedPaymentEvidence) else {
+            logger.info("payment.validation.rejected reason=methodEvidenceMismatch")
+            uncertain.insert("paymentMethod")
+            return nil
+        }
+
+        logger.info("payment.validation.accepted strategy=verifiedModelValue")
+        uncertain.remove("paymentMethod")
         return paymentMethod
+    }
+
+    private func paymentEvidenceIsSupported(
+        method: String,
+        evidence: String,
+        source: String
+    ) -> Bool {
+        if source.contains(evidence) || source.contains(method) {
+            return true
+        }
+
+        if let lastFour = lastFourDigits(in: evidence) ?? lastFourDigits(in: method),
+           source.contains(lastFour) {
+            return true
+        }
+
+        let observed = method + evidence
+        let paymentKeywords = [
+            "applepay", "googlepay", "支付宝", "微信支付", "微信", "银联",
+            "visa", "mastercard", "amex", "信用卡", "借记卡", "银行卡",
+            "debit", "credit", "paywave"
+        ]
+        return paymentKeywords.contains {
+            observed.contains($0) && source.contains($0)
+        }
+    }
+
+    private func lastFourDigits(in text: String) -> String? {
+        guard let regex = try? NSRegularExpression(pattern: #"(?<!\d)(\d{4})(?!\d)"#),
+              let match = regex.firstMatch(
+                in: text,
+                range: NSRange(text.startIndex..., in: text)
+              ),
+              match.numberOfRanges > 1,
+              let range = Range(match.range(at: 1), in: text) else {
+            return nil
+        }
+        return String(text[range])
     }
 
     private func sanitized(_ text: String, maximumLength: Int) -> String {
@@ -793,6 +1252,7 @@ struct FoundationModelTransactionParser: TransactionParsing {
             "dateEvidence": candidate.dateEvidence,
             "paymentMethod": candidate.paymentMethod,
             "paymentMethodEvidence": candidate.paymentMethodEvidence,
+            "paymentMethodConfidence": candidate.paymentMethodConfidence,
             "note": candidate.note,
             "confidence": candidate.confidence,
             "needsConfirmation": candidate.needsConfirmation.map(\.rawValue)

@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import OSLog
 #if canImport(FoundationModels)
 import FoundationModels
 #endif
@@ -66,6 +67,7 @@ final class AppModel {
     var lastExcludedStatusBarLines: [String] = []
 
     private let store = LedgerStore()
+    private let logger = Logger(subsystem: "com.example.SnapLedger", category: "RecognitionPostProcessing")
     private let recognitionAgent = TransactionRecognitionAgent()
     private var importTask: Task<Void, Never>?
 
@@ -200,10 +202,10 @@ final class AppModel {
                         context: context
                     ) { [weak self] event in
                         await MainActor.run {
-                            self?.analysisPhase = event
+                            self?.analysisPhase = event.message
                             self?.appendAnalysisEvent(
-                                "第 \(index + 1) 张：\(event)",
-                                kind: Self.eventKind(for: event)
+                                "第 \(index + 1) 张：\(event.message)",
+                                kind: Self.eventKind(for: event.message)
                             )
                         }
                     }
@@ -327,12 +329,9 @@ final class AppModel {
         let merchant = normalizedMerchant(parsed.transaction.merchant)
         guard !merchant.isEmpty else { return result }
 
-        let builtInAliases: [(alias: String, category: String)] = [
-            ("keeta", "餐饮"), ("美团外卖", "餐饮"), ("饿了么", "餐饮"),
-            ("ubereats", "餐饮"), ("foodpanda", "餐饮"), ("deliveroo", "餐饮"),
-            ("滴滴", "交通"), ("uber", "交通"), ("grab", "交通")
-        ]
-        let builtInCategory = builtInAliases.first { merchant.contains($0.alias) }?.category
+        let builtInCategory = MerchantCategoryKnowledgeBase.trustedCategory(
+            forMerchant: parsed.transaction.merchant
+        )
 
         let historicalCategory = ledger?.transactions
             .filter { normalizedMerchant($0.merchant) == merchant }
@@ -341,8 +340,11 @@ final class AppModel {
             }
             .max { lhs, rhs in lhs.value < rhs.value }?.key
 
-        guard let category = historicalCategory ?? builtInCategory,
+        guard let category = builtInCategory ?? historicalCategory,
               categories.contains(category) else { return result }
+        let categorySource = builtInCategory != nil ? "builtInAlias" : "history"
+        let previousCategory = result.transaction.category
+        logger.info("category.override source=\(categorySource, privacy: .public) from=\(previousCategory, privacy: .public) to=\(category, privacy: .public)")
         result.transaction.category = category
         result.lowConfidenceFields.remove("category")
         result.source += " · 商户分类记忆"
@@ -350,10 +352,7 @@ final class AppModel {
     }
 
     private func normalizedMerchant(_ merchant: String) -> String {
-        merchant
-            .folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: .current)
-            .replacingOccurrences(of: #"[^\p{L}\p{N}]"#, with: "", options: .regularExpression)
-            .lowercased()
+        MerchantCategoryKnowledgeBase.normalize(merchant)
     }
 
     func confirm(_ transaction: LedgerTransaction) async {

@@ -46,10 +46,16 @@ struct IMESafeTextField: View {
 
 struct IMESafeTextEditor: View {
     @Binding var text: String
+    let isFocused: Binding<Bool>?
+
+    init(text: Binding<String>, isFocused: Binding<Bool>? = nil) {
+        _text = text
+        self.isFocused = isFocused
+    }
 
     var body: some View {
         #if os(iOS)
-        IMESafeUITextView(text: $text)
+        IMESafeUITextView(text: $text, isFocused: isFocused)
         #else
         TextEditor(text: $text)
         #endif
@@ -146,9 +152,10 @@ private struct IMESafeUITextField: UIViewRepresentable {
 
 private struct IMESafeUITextView: UIViewRepresentable {
     @Binding var text: String
+    let isFocused: Binding<Bool>?
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(text: $text)
+        Coordinator(text: $text, isFocused: isFocused)
     }
 
     func makeUIView(context: Context) -> UITextView {
@@ -163,6 +170,16 @@ private struct IMESafeUITextView: UIViewRepresentable {
 
     func updateUIView(_ textView: UITextView, context: Context) {
         context.coordinator.text = $text
+        context.coordinator.isFocused = isFocused
+
+        if let isFocused {
+            if isFocused.wrappedValue, !textView.isFirstResponder {
+                DispatchQueue.main.async { textView.becomeFirstResponder() }
+            } else if !isFocused.wrappedValue, textView.isFirstResponder {
+                textView.resignFirstResponder()
+            }
+        }
+
         guard textView.markedTextRange == nil, textView.text != text else { return }
         textView.text = text
     }
@@ -170,14 +187,24 @@ private struct IMESafeUITextView: UIViewRepresentable {
     @MainActor
     final class Coordinator: NSObject, UITextViewDelegate {
         var text: Binding<String>
+        var isFocused: Binding<Bool>?
 
-        init(text: Binding<String>) {
+        init(text: Binding<String>, isFocused: Binding<Bool>?) {
             self.text = text
+            self.isFocused = isFocused
         }
 
         func textViewDidChange(_ textView: UITextView) {
             guard textView.markedTextRange == nil else { return }
             text.wrappedValue = textView.text
+        }
+
+        func textViewDidBeginEditing(_ textView: UITextView) {
+            isFocused?.wrappedValue = true
+        }
+
+        func textViewDidEndEditing(_ textView: UITextView) {
+            isFocused?.wrappedValue = false
         }
     }
 }

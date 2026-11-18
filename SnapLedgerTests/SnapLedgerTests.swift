@@ -45,6 +45,20 @@ struct SnapLedgerTests {
         #expect(DateParsing.parse("2026.11.13 09:42") != nil)
     }
 
+    @Test func completeDateWithoutTimeDoesNotRequireConfirmation() throws {
+        let result = try #require(DateParsing.resolve("2026年11月13日"))
+        #expect(result.precision == .dateOnly)
+        #expect(!result.requiresConfirmation)
+    }
+
+    @Test func ruleParserAcceptsCompleteDateWithoutTime() async throws {
+        let result = try await RuleBasedTransactionParser().parse(
+            text: "交易日期 2026年11月13日\n实付 ¥28.50",
+            defaultCurrency: .CNY
+        )
+        #expect(!result.lowConfidenceFields.contains("date"))
+    }
+
     @Test func missingYearUsesMostRecentNonFutureDate() throws {
         let now = try #require(ISO8601DateFormatter().date(from: "2026-01-02T10:00:00+08:00"))
         let result = try #require(DateParsing.resolve("12月31日 23:30", now: now))
@@ -236,6 +250,53 @@ struct SnapLedgerTests {
         #expect(result.transaction.currency == .CNY)
         #expect(result.transaction.paymentMethod == "微信支付")
         #expect(result.transaction.category == "餐饮")
+    }
+
+    @Test func ruleParserClassifiesMcDonaldsAsDining() async throws {
+        let result = try await RuleBasedTransactionParser().parse(
+            text: "McDonald's\n实付 USD 12.80",
+            defaultCurrency: .USD
+        )
+        #expect(result.transaction.category == "餐饮")
+    }
+
+    @Test func merchantCategoryKnowledgeBaseNormalizesAliasesAndPreservesSpecificity() {
+        #expect(MerchantCategoryKnowledgeBase.trustedCategory(forMerchant: "McDonald's") == "餐饮")
+        #expect(MerchantCategoryKnowledgeBase.trustedCategory(forMerchant: "Uber Eats") == "餐饮")
+        #expect(MerchantCategoryKnowledgeBase.trustedCategory(forMerchant: "UBER") == "交通")
+        #expect(MerchantCategoryKnowledgeBase.trustedCategory(forMerchant: "未知商户") == nil)
+    }
+
+    @Test func ruleParserMatchesMaintainedPaymentMethodByExactName() async throws {
+        let result = try await RuleBasedTransactionParser().parse(
+            text: "Apple Pay\nDBS Visa •••• 1234\n实付 SGD 18.80",
+            defaultCurrency: .USD,
+            categoryNames: [],
+            paymentMethodNames: ["DBS Visa •••• 1234"]
+        )
+        #expect(result.transaction.paymentMethod == "DBS Visa •••• 1234")
+        #expect(!result.lowConfidenceFields.contains("paymentMethod"))
+    }
+
+    @Test func ruleParserMatchesUniqueMaintainedPaymentMethodByLastFour() async throws {
+        let result = try await RuleBasedTransactionParser().parse(
+            text: "支付方式 招商银行信用卡（1234）\n实付 ¥18.80",
+            defaultCurrency: .CNY,
+            categoryNames: [],
+            paymentMethodNames: ["招商银行 Visa •••• 1234", "DBS Visa •••• 5678"]
+        )
+        #expect(result.transaction.paymentMethod == "招商银行 Visa •••• 1234")
+        #expect(!result.lowConfidenceFields.contains("paymentMethod"))
+    }
+
+    @Test func ruleParserDoesNotChooseAmbiguousLastFour() async throws {
+        let result = try await RuleBasedTransactionParser().parse(
+            text: "支付方式 信用卡（1234）\n实付 ¥18.80",
+            defaultCurrency: .CNY,
+            categoryNames: [],
+            paymentMethodNames: ["招商银行 Visa •••• 1234", "中信银行 Visa •••• 1234"]
+        )
+        #expect(result.transaction.paymentMethod == "信用卡")
     }
 
     @Test func unavailableFoundationModelFallsBackToRules() async throws {
