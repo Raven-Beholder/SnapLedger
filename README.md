@@ -1,4 +1,8 @@
-# SnapLedger
+<p align="center">
+  <img src="SnapLedger/Assets.xcassets/AppIcon.appiconset/AppIcon-mac-128.png" width="128" height="128" alt="SnapLedger app icon">
+</p>
+
+<h1 align="center">SnapLedger</h1>
 
 SnapLedger is a SwiftUI ledger app for importing, recognizing, organizing, and reviewing transactions.
 

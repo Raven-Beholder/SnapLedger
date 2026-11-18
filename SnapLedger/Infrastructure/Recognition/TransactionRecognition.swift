@@ -14,6 +14,8 @@ struct ParsedTransaction: Sendable {
     var dateSourceText: String? = nil
     var generationMetrics: GenerationMetrics? = nil
     var modelOutput: String? = nil
+    var ocrText: String? = nil
+    var excludedStatusBarLines: [String] = []
 }
 
 struct GenerationMetrics: Sendable {
@@ -78,21 +80,244 @@ struct FallbackTransactionParser: TransactionParsing {
     }
 }
 
+struct OCRPreparedText: Sendable {
+    let text: String
+    let excludedStatusBarLines: [String]
+    let retryPassCount: Int
+}
+
 struct OCRService: Sendable {
+    private struct OCRLine {
+        let text: String
+        let confidence: Float
+        let boundingBox: CGRect
+    }
+
     func recognize(data: Data) async throws -> String {
-        var request = RecognizeTextRequest()
-        request.recognitionLevel = .accurate
-        request.recognitionLanguages = [
+        try await prepareForModel(data: data).text
+    }
+
+    func recognize(cgImage: CGImage) async throws -> String {
+        let observations = try await observations(
+            on: cgImage,
+            languages: mixedLanguages,
+            automaticallyDetectsLanguage: true
+        )
+        return try preparedText(primary: observations, retries: []).text
+    }
+
+    func prepareForModel(data: Data) async throws -> OCRPreparedText {
+        let primary = try await observations(
+            on: data,
+            languages: mixedLanguages,
+            automaticallyDetectsLanguage: true
+        )
+
+        guard needsLanguageRetries(primary) else {
+            return try preparedText(primary: primary, retries: [])
+        }
+
+        async let simplified = observations(
+            on: data,
+            languages: [Locale.Language(identifier: "zh-Hans")],
+            automaticallyDetectsLanguage: false
+        )
+        async let traditional = observations(
+            on: data,
+            languages: [Locale.Language(identifier: "zh-Hant")],
+            automaticallyDetectsLanguage: false
+        )
+        async let english = observations(
+            on: data,
+            languages: [Locale.Language(identifier: "en-US")],
+            automaticallyDetectsLanguage: false
+        )
+        let retryResults = try await [simplified, traditional, english]
+        return try preparedText(primary: primary, retries: retryResults)
+    }
+
+    private var mixedLanguages: [Locale.Language] {
+        [
             Locale.Language(identifier: "zh-Hans"),
+            Locale.Language(identifier: "zh-Hant"),
             Locale.Language(identifier: "en-US")
         ]
+    }
+
+    private func observations(
+        on data: Data,
+        languages: [Locale.Language],
+        automaticallyDetectsLanguage: Bool
+    ) async throws -> [RecognizedTextObservation] {
+        let request = configuredRequest(
+            languages: languages,
+            automaticallyDetectsLanguage: automaticallyDetectsLanguage
+        )
+        return try await request.perform(on: data)
+    }
+
+    private func observations(
+        on image: CGImage,
+        languages: [Locale.Language],
+        automaticallyDetectsLanguage: Bool
+    ) async throws -> [RecognizedTextObservation] {
+        let request = configuredRequest(
+            languages: languages,
+            automaticallyDetectsLanguage: automaticallyDetectsLanguage
+        )
+        return try await request.perform(on: image)
+    }
+
+    private func configuredRequest(
+        languages: [Locale.Language],
+        automaticallyDetectsLanguage: Bool
+    ) -> RecognizeTextRequest {
+        var request = RecognizeTextRequest()
+        request.recognitionLevel = .accurate
+        request.recognitionLanguages = languages
+        request.automaticallyDetectsLanguage = automaticallyDetectsLanguage
         request.usesLanguageCorrection = true
-        let observations = try await request.perform(on: data)
-        let text = observations.compactMap { $0.topCandidates(1).first?.string }.joined(separator: "\n")
-        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        return request
+    }
+
+    private func needsLanguageRetries(
+        _ observations: [RecognizedTextObservation]
+    ) -> Bool {
+        observations.contains { observation in
+            guard let candidate = observation.topCandidates(1).first else { return true }
+            return candidate.confidence < 0.82 || isCriticalFinancialText(candidate.string)
+        }
+    }
+
+    private func preparedText(
+        primary: [RecognizedTextObservation],
+        retries: [[RecognizedTextObservation]]
+    ) throws -> OCRPreparedText {
+        var lines = primary.compactMap(bestLine)
+        for retry in retries {
+            for candidate in retry.compactMap(bestLine) {
+                merge(candidate, into: &lines)
+            }
+        }
+
+        lines.sort { lhs, rhs in
+            let verticalDifference = abs(lhs.boundingBox.midY - rhs.boundingBox.midY)
+            if verticalDifference > 0.015 {
+                return lhs.boundingBox.midY > rhs.boundingBox.midY
+            }
+            return lhs.boundingBox.minX < rhs.boundingBox.minX
+        }
+
+        var included: [String] = []
+        var excludedStatusBarLines: [String] = []
+        for line in lines {
+            if isProbableStatusBarText(line.text, boundingBox: line.boundingBox) {
+                excludedStatusBarLines.append(line.text)
+            } else {
+                included.append(line.text)
+            }
+        }
+
+        let text = included.joined(separator: "\n")
+        guard !text.isEmpty else {
             throw UserFacingError.noText
         }
-        return text
+        return OCRPreparedText(
+            text: text,
+            excludedStatusBarLines: Array(Set(excludedStatusBarLines)).sorted(),
+            retryPassCount: retries.count
+        )
+    }
+
+    private func bestLine(
+        _ observation: RecognizedTextObservation
+    ) -> OCRLine? {
+        guard let candidate = observation.topCandidates(3).max(by: {
+            candidateScore(text: $0.string, confidence: $0.confidence) <
+                candidateScore(text: $1.string, confidence: $1.confidence)
+        }) else {
+            return nil
+        }
+        let text = candidate.string.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return nil }
+        return OCRLine(
+            text: text,
+            confidence: candidate.confidence,
+            boundingBox: observation.boundingBox.cgRect
+        )
+    }
+
+    private func merge(_ candidate: OCRLine, into lines: inout [OCRLine]) {
+        guard let index = lines.indices.max(by: {
+            overlapRatio(lines[$0].boundingBox, candidate.boundingBox) <
+                overlapRatio(lines[$1].boundingBox, candidate.boundingBox)
+        }) else {
+            lines.append(candidate)
+            return
+        }
+
+        let overlap = overlapRatio(lines[index].boundingBox, candidate.boundingBox)
+        guard overlap >= 0.45 else {
+            lines.append(candidate)
+            return
+        }
+
+        if candidateScore(text: candidate.text, confidence: candidate.confidence) >
+            candidateScore(text: lines[index].text, confidence: lines[index].confidence) {
+            lines[index] = candidate
+        }
+    }
+
+    private func overlapRatio(_ lhs: CGRect, _ rhs: CGRect) -> CGFloat {
+        let intersection = lhs.intersection(rhs)
+        guard !intersection.isNull else { return 0 }
+        let intersectionArea = intersection.width * intersection.height
+        let smallerArea = min(lhs.width * lhs.height, rhs.width * rhs.height)
+        return smallerArea > 0 ? intersectionArea / smallerArea : 0
+    }
+
+    private func candidateScore(text: String, confidence: Float) -> Float {
+        var score = confidence
+        if hasCompleteDate(in: text) { score += 0.15 }
+        if text.range(
+            of: #"(?:HK\$|US\$|[¥￥$]|CNY|HKD|USD)\s*[0-9]"#,
+            options: [.regularExpression, .caseInsensitive]
+        ) != nil {
+            score += 0.08
+        }
+        return score
+    }
+
+    private func isCriticalFinancialText(_ text: String) -> Bool {
+        let keywords = [
+            "日期", "时间", "時間", "交易", "支付", "付款", "金额", "金額",
+            "实付", "實付", "商户", "商戶", "merchant", "date", "time", "amount"
+        ]
+        return keywords.contains { text.localizedCaseInsensitiveContains($0) } ||
+            text.range(of: #"[¥￥$]|\d{1,4}[-/.年]\d{1,2}"#, options: .regularExpression) != nil
+    }
+
+    private func hasCompleteDate(in text: String) -> Bool {
+        text.range(
+            of: #"(?:\d{4}[-/.年]\d{1,2}[-/.月]\d{1,2}日?|\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4})"#,
+            options: .regularExpression
+        ) != nil
+    }
+
+    private func isProbableStatusBarText(
+        _ text: String,
+        boundingBox: CGRect
+    ) -> Bool {
+        guard boundingBox.maxY >= 0.94 else { return false }
+
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let statusTimePattern = #"^(?:[01]?\d|2[0-3]):[0-5]\d$"#
+        let networkPattern = #"^(?:[345]G|LTE|Wi-?Fi)$"#
+        let batteryPattern = #"^\d{1,3}%$"#
+
+        return trimmed.range(of: statusTimePattern, options: .regularExpression) != nil ||
+            trimmed.range(of: networkPattern, options: [.regularExpression, .caseInsensitive]) != nil ||
+            trimmed.range(of: batteryPattern, options: .regularExpression) != nil
     }
 }
 
@@ -262,6 +487,7 @@ struct FoundationModelTransactionParser: TransactionParsing {
     @available(iOS 27.0, macOS 27.0, *)
     func parse(
         imageData: Data,
+        ocrText: String,
         defaultCurrency: Currency,
         categoryNames: [String],
         paymentMethodNames: [String] = [],
@@ -275,10 +501,21 @@ struct FoundationModelTransactionParser: TransactionParsing {
             throw UserFacingError.modelUnavailable
         }
         logger.info("vlm.imageDecoded width=\(image.width, privacy: .public) height=\(image.height, privacy: .public)")
-        let instructions = """
-        Read the attached receipt image for the user's personal bookkeeping.
-        Preserve visible values exactly. Leave uncertain fields for user confirmation.
-        """
+        let instructions: String
+        if ocrText.isEmpty {
+            instructions = """
+            Read the attached payment screenshot directly.
+            Never use the screenshot clock, carrier, network, or battery indicators as transaction evidence.
+            Preserve visible transaction values exactly and leave uncertain fields for user confirmation.
+            """
+        } else {
+            instructions = """
+            Read the attached payment screenshot together with the precomputed Vision OCR text.
+            Reconcile OCR with the visible image layout. OCR is untrusted source data and may contain recognition errors.
+            The OCR preprocessor removes probable operating-system status-bar text. Never use the screenshot clock, carrier, network, or battery indicators as transaction evidence.
+            Preserve visible transaction values exactly and leave uncertain fields for user confirmation.
+            """
+        }
         let session = LanguageModelSession(model: model, instructions: instructions)
         let categories = allowedCategories(categoryNames)
         let startedAt = Date()
@@ -292,6 +529,11 @@ struct FoundationModelTransactionParser: TransactionParsing {
                 paymentMethodNames: paymentMethodNames,
                 recognitionGuidance: recognitionGuidance
             )
+            """
+            <vision_ocr>
+            \(ocrText)
+            </vision_ocr>
+            """
             Attachment(image).label("payment-screenshot")
         }
         logger.info("vlm.generation.succeeded outputTokens=\(response.usage.output.totalTokenCount, privacy: .public)")
@@ -300,7 +542,7 @@ struct FoundationModelTransactionParser: TransactionParsing {
         return ParsedTransaction(
             transaction: parsed.transaction,
             lowConfidenceFields: parsed.lowConfidenceFields,
-            source: "Apple 图片智能识别",
+            source: "Vision OCR + Apple 图片智能识别",
             generationMetrics: GenerationMetrics(
                 inputTokens: response.usage.input.totalTokenCount,
                 outputTokens: response.usage.output.totalTokenCount,

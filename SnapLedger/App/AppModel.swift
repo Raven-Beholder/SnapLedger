@@ -4,6 +4,31 @@ import Observation
 import FoundationModels
 #endif
 
+struct AnalysisTimelineEvent: Identifiable, Sendable {
+    enum Kind: Sendable {
+        case phase
+        case tool
+        case success
+        case failure
+    }
+
+    let id: UUID
+    let timestamp: Date
+    let message: String
+    let kind: Kind
+
+    init(
+        timestamp: Date = .now,
+        message: String,
+        kind: Kind
+    ) {
+        id = UUID()
+        self.timestamp = timestamp
+        self.message = message
+        self.kind = kind
+    }
+}
+
 @MainActor
 @Observable
 final class AppModel {
@@ -34,13 +59,14 @@ final class AppModel {
     var analysisPhase = "等待导入"
     var analysisStartedAt: Date?
     var analysisEndedAt: Date?
-    var analysisEvents: [String] = []
+    var analysisEvents: [AnalysisTimelineEvent] = []
     var lastGenerationMetrics: GenerationMetrics?
     var lastStructuredOutput = ""
+    var lastOCRText = ""
+    var lastExcludedStatusBarLines: [String] = []
 
     private let store = LedgerStore()
-    private let ocr = OCRService()
-    private let parser = FoundationModelTransactionParser()
+    private let recognitionAgent = TransactionRecognitionAgent()
     private var importTask: Task<Void, Never>?
 
     var visibleTransactions: [LedgerTransaction] {
@@ -110,6 +136,17 @@ final class AppModel {
         }
     }
 
+    func refreshLedger() async {
+        guard let ledgerURL else { return }
+        do {
+            let refreshedLedger = try await store.open(ledgerURL)
+            ledger = refreshedLedger
+            defaultCurrency = refreshedLedger.defaultCurrency
+        } catch {
+            present(error)
+        }
+    }
+
     func createLedger(at url: URL) async {
         do {
             ledger = try await store.create(at: url, defaultCurrency: defaultCurrency)
@@ -119,16 +156,23 @@ final class AppModel {
         }
     }
 
-    func importImages(_ images: [Data]) {
+    func importImages(_ images: [Data], reviewFirstWhenReady: Bool = false) {
         importTask?.cancel()
         importTask = Task { [weak self] in
             guard let self else { return }
             pendingTransactions.removeAll()
             analysisStartedAt = .now
             analysisEndedAt = nil
-            analysisEvents = ["已加载 \(images.count) 张图片"]
+            analysisEvents = [
+                AnalysisTimelineEvent(
+                    message: "已加载 \(images.count) 张图片",
+                    kind: .phase
+                )
+            ]
             lastGenerationMetrics = nil
             lastStructuredOutput = ""
+            lastOCRText = ""
+            lastExcludedStatusBarLines = []
             importState = .processing(current: 0, total: images.count)
             var imageQueue = images
             for index in imageQueue.indices {
@@ -140,40 +184,43 @@ final class AppModel {
                     return
                 }
                 do {
-                    var parsed: ParsedTransaction
-                    let categoryNames = categories
-                    let paymentMethodNames = paymentMethods
-                    let guidance = ledger?.recognitionGuidance ?? ""
-                    analysisPhase = "Apple 图片智能识别"
-                    analysisEvents.append("第 \(index + 1) 张：开始图片理解")
-                    if #available(iOS 27.0, macOS 27.0, *) {
-                        parsed = try await parser.parse(
-                            imageData: imageData,
-                            defaultCurrency: defaultCurrency,
-                            categoryNames: categoryNames,
-                            paymentMethodNames: paymentMethodNames,
-                            recognitionGuidance: guidance
-                        )
-                    } else {
-                        analysisPhase = "Vision OCR + 文本整理"
-                        let text = try await ocr.recognize(data: imageData)
-                        parsed = try await parser.parse(
-                            text: text,
-                            defaultCurrency: defaultCurrency,
-                            categoryNames: categories,
-                            paymentMethodNames: paymentMethodNames,
-                            recognitionGuidance: ledger?.recognitionGuidance ?? ""
-                        )
+                    let context = TransactionRecognitionContext(
+                        defaultCurrency: defaultCurrency,
+                        categoryNames: categories,
+                        paymentMethodNames: paymentMethods,
+                        recognitionGuidance: ledger?.recognitionGuidance ?? ""
+                    )
+                    analysisPhase = "识别 Agent 运行中"
+                    appendAnalysisEvent(
+                        "第 \(index + 1) 张：Agent 启动",
+                        kind: .phase
+                    )
+                    var parsed = try await recognitionAgent.run(
+                        imageData: imageData,
+                        context: context
+                    ) { [weak self] event in
+                        await MainActor.run {
+                            self?.analysisPhase = event
+                            self?.appendAnalysisEvent(
+                                "第 \(index + 1) 张：\(event)",
+                                kind: Self.eventKind(for: event)
+                            )
+                        }
                     }
                     parsed.sourceImageData = imageData
                     parsed = applyingMerchantCategoryMemory(to: parsed)
                     lastGenerationMetrics = parsed.generationMetrics
                     lastStructuredOutput = parsed.modelOutput ?? "模型未提供可展示的原始结构化输出。"
-                    analysisEvents.append("第 \(index + 1) 张：识别完成")
+                    lastOCRText = parsed.ocrText ?? ""
+                    lastExcludedStatusBarLines = parsed.excludedStatusBarLines
+                    appendAnalysisEvent(
+                        "第 \(index + 1) 张：识别完成",
+                        kind: .success
+                    )
                     pendingTransactions.append(parsed)
                 } catch {
                     let nsError = error as NSError
-                    analysisPhase = "VLM 生成失败"
+                    analysisPhase = "识别 Agent 失败"
                     var modelDiagnostic = ""
                     #if canImport(FoundationModels)
                     if #available(iOS 27.0, macOS 27.0, *),
@@ -186,13 +233,16 @@ final class AppModel {
                     }
                     #endif
                     lastStructuredOutput = """
-                    模型没有返回结构化输出。
+                    识别 Agent 没有返回结构化交易。
                     errorDomain: \(nsError.domain)
                     errorCode: \(nsError.code)
                     message: \(nsError.localizedDescription)
                     \(modelDiagnostic)
                     """
-                    analysisEvents.append("第 \(index + 1) 张：失败（\(nsError.domain) · \(nsError.code)）")
+                    appendAnalysisEvent(
+                        "第 \(index + 1) 张：失败（\(nsError.domain) · \(nsError.code)）",
+                        kind: .failure
+                    )
                     present(error)
                 }
                 importState = .processing(current: index + 1, total: images.count)
@@ -202,6 +252,9 @@ final class AppModel {
                 if lastStructuredOutput.isEmpty { analysisPhase = "未生成候选交易" }
             } else {
                 analysisPhase = "等待用户确认"
+                if reviewFirstWhenReady, let first = pendingTransactions.first {
+                    review(first)
+                }
             }
             analysisEndedAt = .now
         }
@@ -464,11 +517,44 @@ final class AppModel {
         }
     }
 
+    private func appendAnalysisEvent(
+        _ message: String,
+        kind: AnalysisTimelineEvent.Kind,
+        timestamp: Date = .now
+    ) {
+        analysisEvents.append(
+            AnalysisTimelineEvent(
+                timestamp: timestamp,
+                message: message,
+                kind: kind
+            )
+        )
+    }
+
+    private static func eventKind(for message: String) -> AnalysisTimelineEvent.Kind {
+        if message.localizedCaseInsensitiveContains("失败") ||
+            message.localizedCaseInsensitiveContains("error") {
+            return .failure
+        }
+        if message.contains("工具") || message.localizedCaseInsensitiveContains("OCR") {
+            return .tool
+        }
+        if message.contains("完成") || message.contains("成功") {
+            return .success
+        }
+        return .phase
+    }
+
     private func updateModelStatus() {
         #if canImport(FoundationModels)
-        switch SystemLanguageModel.default.availability {
+        let model = SystemLanguageModel.default
+        switch model.availability {
         case .available:
-            foundationModelStatus = "可用（Apple 设备端模型）"
+            if #available(iOS 27.0, macOS 27.0, *) {
+                foundationModelStatus = "可用（\(model.variant.displayName)）"
+            } else {
+                foundationModelStatus = "可用（Apple 设备端模型）"
+            }
         case .unavailable(.deviceNotEligible):
             foundationModelStatus = "设备不支持，使用本地规则解析"
         case .unavailable(.modelNotReady):

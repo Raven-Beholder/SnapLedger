@@ -49,7 +49,7 @@ struct ImportView: View {
         ) { result in
             switch result {
             case .success(let urls):
-                let images = urls.compactMap { try? Data(contentsOf: $0) }
+                let images = urls.compactMap(loadImageData)
                 if !images.isEmpty { model.importImages(images) }
             case .failure(let error):
                 model.present(error)
@@ -108,7 +108,7 @@ struct ImportView: View {
             Button {
                 isChoosingImages = true
             } label: {
-                Label("选择图片", systemImage: "photo.on.rectangle.angled")
+                Label("从文件选择图片", systemImage: "folder.badge.plus")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
@@ -120,6 +120,16 @@ struct ImportView: View {
     }
 
     #if os(macOS)
+    private func loadImageData(from url: URL) -> Data? {
+        let hasAccess = url.startAccessingSecurityScopedResource()
+        defer {
+            if hasAccess {
+                url.stopAccessingSecurityScopedResource()
+            }
+        }
+        return try? Data(contentsOf: url)
+    }
+
     private var dropTarget: some View {
         Text("也可以把图片拖到这里")
             .font(.callout)
@@ -208,6 +218,12 @@ private struct ModelDiagnosticsView: View {
                         value: metrics.tokensPerSecond.formatted(.number.precision(.fractionLength(1))) + " token/s"
                     )
                 }
+                if !model.lastOCRText.isEmpty {
+                    OCRDiagnosticsSection(
+                        text: model.lastOCRText,
+                        excludedStatusBarLines: model.lastExcludedStatusBarLines
+                    )
+                }
                 if !model.lastStructuredOutput.isEmpty {
                     Text("模型结构化输出")
                         .font(.headline)
@@ -219,13 +235,10 @@ private struct ModelDiagnosticsView: View {
                         .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
                 }
                 if !model.analysisEvents.isEmpty {
-                    Text("Pipeline 事件")
-                        .font(.headline)
-                    ForEach(Array(model.analysisEvents.enumerated()), id: \.offset) { _, event in
-                        Text("• \(event)")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
+                    PipelineTimelineView(
+                        events: model.analysisEvents,
+                        startDate: model.analysisStartedAt
+                    )
                 }
                 Text("仅显示模型返回的字段和公开 usage 数据，不展示或保存私有思维链。")
                     .font(.caption)
@@ -240,6 +253,132 @@ private struct ModelDiagnosticsView: View {
                     Button("完成") { dismiss() }
                 }
             }
+        }
+    }
+}
+
+private struct OCRDiagnosticsSection: View {
+    let text: String
+    let excludedStatusBarLines: [String]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Vision OCR 结果")
+                .font(.headline)
+
+            Text(text)
+                .font(.system(.caption, design: .monospaced))
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(10)
+                .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
+
+            if !excludedStatusBarLines.isEmpty {
+                LabeledContent("已过滤状态栏") {
+                    Text(excludedStatusBarLines.formatted())
+                        .textSelection(.enabled)
+                        .multilineTextAlignment(.trailing)
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
+private struct PipelineTimelineView: View {
+    let events: [AnalysisTimelineEvent]
+    let startDate: Date?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Pipeline 时间轴")
+                .font(.headline)
+
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(events.enumerated(), id: \.element.id) { index, event in
+                    PipelineTimelineRow(
+                        event: event,
+                        startDate: startDate,
+                        isLast: index == events.count - 1
+                    )
+                }
+            }
+        }
+    }
+}
+
+private struct PipelineTimelineRow: View {
+    let event: AnalysisTimelineEvent
+    let startDate: Date?
+    let isLast: Bool
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Text(elapsedText)
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .frame(width: 58, alignment: .trailing)
+
+            VStack(spacing: 0) {
+                Image(systemName: symbolName)
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(eventColor)
+                    .frame(width: 18, height: 18)
+                    .background(eventColor.opacity(0.14), in: Circle())
+
+                if !isLast {
+                    Rectangle()
+                        .fill(.quaternary)
+                        .frame(width: 2)
+                        .frame(maxHeight: .infinity)
+                }
+            }
+            .frame(width: 18)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(event.message)
+                    .font(.caption)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Text(event.timestamp, format: .dateTime.hour().minute().second())
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(.bottom, isLast ? 0 : 12)
+        }
+        .frame(minHeight: isLast ? 24 : 52, alignment: .top)
+        .accessibilityElement(children: .combine)
+    }
+
+    private var elapsedText: String {
+        guard let startDate else { return "—" }
+        let elapsed = max(0, event.timestamp.timeIntervalSince(startDate))
+        return "+" + elapsed.formatted(.number.precision(.fractionLength(1))) + "s"
+    }
+
+    private var eventColor: Color {
+        switch event.kind {
+        case .phase:
+            .secondary
+        case .tool:
+            .blue
+        case .success:
+            .green
+        case .failure:
+            .red
+        }
+    }
+
+    private var symbolName: String {
+        switch event.kind {
+        case .phase:
+            "circle.fill"
+        case .tool:
+            "wrench.and.screwdriver.fill"
+        case .success:
+            "checkmark"
+        case .failure:
+            "exclamationmark"
         }
     }
 }
@@ -405,11 +544,7 @@ struct ConfirmationView: View {
                         label: fieldLabel("支付方式", key: "paymentMethod")
                     )
                     LabeledContent(fieldLabel("备注", key: "note")) {
-                        TextField(text: $noteText, prompt: Text("选填"), axis: .vertical) {
-                            Text("备注输入")
-                        }
-                            .labelsHidden()
-                            .multilineTextAlignment(.trailing)
+                        IMESafeTextField("选填", text: $noteText)
                     }
                 }
                 if let validationMessage {

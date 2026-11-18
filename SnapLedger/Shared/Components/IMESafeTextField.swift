@@ -7,15 +7,21 @@ struct IMESafeTextField: View {
     let placeholder: String
     @Binding var text: String
     let alignment: TextAlignment
+    let isFocused: Binding<Bool>?
+    let onSubmit: (() -> Void)?
 
     init(
         _ placeholder: String,
         text: Binding<String>,
-        alignment: TextAlignment = .trailing
+        alignment: TextAlignment = .trailing,
+        isFocused: Binding<Bool>? = nil,
+        onSubmit: (() -> Void)? = nil
     ) {
         self.placeholder = placeholder
         _text = text
         self.alignment = alignment
+        self.isFocused = isFocused
+        self.onSubmit = onSubmit
     }
 
     var body: some View {
@@ -23,7 +29,9 @@ struct IMESafeTextField: View {
         IMESafeUITextField(
             placeholder: placeholder,
             text: $text,
-            alignment: alignment
+            alignment: alignment,
+            isFocused: isFocused,
+            onSubmit: onSubmit
         )
         .frame(minHeight: 24)
         #else
@@ -36,22 +44,39 @@ struct IMESafeTextField: View {
     }
 }
 
+struct IMESafeTextEditor: View {
+    @Binding var text: String
+
+    var body: some View {
+        #if os(iOS)
+        IMESafeUITextView(text: $text)
+        #else
+        TextEditor(text: $text)
+        #endif
+    }
+}
+
 #if os(iOS)
 private struct IMESafeUITextField: UIViewRepresentable {
     let placeholder: String
     @Binding var text: String
     let alignment: TextAlignment
+    let isFocused: Binding<Bool>?
+    let onSubmit: (() -> Void)?
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(text: $text)
+        Coordinator(text: $text, isFocused: isFocused, onSubmit: onSubmit)
     }
 
     func makeUIView(context: Context) -> UITextField {
         let field = UITextField(frame: .zero)
         field.placeholder = placeholder
         field.text = text
+        field.borderStyle = .none
+        field.backgroundColor = .clear
         field.textAlignment = alignment == .leading ? .left : .right
         field.adjustsFontForContentSizeCategory = true
+        field.delegate = context.coordinator
         field.addTarget(
             context.coordinator,
             action: #selector(Coordinator.textDidChange(_:)),
@@ -64,23 +89,95 @@ private struct IMESafeUITextField: UIViewRepresentable {
         field.placeholder = placeholder
         field.textAlignment = alignment == .leading ? .left : .right
         context.coordinator.text = $text
+        context.coordinator.isFocused = isFocused
+        context.coordinator.onSubmit = onSubmit
+
+        if let isFocused {
+            if isFocused.wrappedValue, !field.isFirstResponder {
+                DispatchQueue.main.async { field.becomeFirstResponder() }
+            } else if !isFocused.wrappedValue, field.isFirstResponder {
+                field.resignFirstResponder()
+            }
+        }
 
         // Never replace text while an IME is composing marked text. Doing so
         // commits or splits the first pinyin syllable before the user selects it.
-        guard field.markedTextRange == nil, field.text != text else { return }
-        field.text = text
+        if field.markedTextRange == nil, field.text != text {
+            field.text = text
+        }
     }
 
     @MainActor
-    final class Coordinator: NSObject {
+    final class Coordinator: NSObject, UITextFieldDelegate {
+        var text: Binding<String>
+        var isFocused: Binding<Bool>?
+        var onSubmit: (() -> Void)?
+
+        init(
+            text: Binding<String>,
+            isFocused: Binding<Bool>?,
+            onSubmit: (() -> Void)?
+        ) {
+            self.text = text
+            self.isFocused = isFocused
+            self.onSubmit = onSubmit
+        }
+
+        @objc func textDidChange(_ field: UITextField) {
+            guard field.markedTextRange == nil else { return }
+            text.wrappedValue = field.text ?? ""
+        }
+
+        func textFieldDidBeginEditing(_ textField: UITextField) {
+            isFocused?.wrappedValue = true
+        }
+
+        func textFieldDidEndEditing(_ textField: UITextField) {
+            isFocused?.wrappedValue = false
+        }
+
+        func textFieldShouldReturn(_ textField: UITextField) -> Bool {
+            guard textField.markedTextRange == nil else { return false }
+            onSubmit?()
+            return false
+        }
+    }
+}
+
+private struct IMESafeUITextView: UIViewRepresentable {
+    @Binding var text: String
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(text: $text)
+    }
+
+    func makeUIView(context: Context) -> UITextView {
+        let textView = UITextView(frame: .zero)
+        textView.text = text
+        textView.font = .preferredFont(forTextStyle: .body)
+        textView.adjustsFontForContentSizeCategory = true
+        textView.backgroundColor = .clear
+        textView.delegate = context.coordinator
+        return textView
+    }
+
+    func updateUIView(_ textView: UITextView, context: Context) {
+        context.coordinator.text = $text
+        guard textView.markedTextRange == nil, textView.text != text else { return }
+        textView.text = text
+    }
+
+    @MainActor
+    final class Coordinator: NSObject, UITextViewDelegate {
         var text: Binding<String>
 
         init(text: Binding<String>) {
             self.text = text
         }
 
-        @objc func textDidChange(_ field: UITextField) {
-            text.wrappedValue = field.text ?? ""
+        func textViewDidChange(_ textView: UITextView) {
+            guard textView.markedTextRange == nil else { return }
+            text.wrappedValue = textView.text
         }
     }
 }

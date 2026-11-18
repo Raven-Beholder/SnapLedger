@@ -1,8 +1,22 @@
 import SwiftUI
+import UniformTypeIdentifiers
+#if os(iOS)
+import PhotosUI
+#endif
 
 struct TransactionListView: View {
     let model: AppModel
+    let onAutomaticImport: () -> Void
     @State private var isShowingFilters = false
+    @State private var isChoosingImages = false
+    #if os(iOS)
+    @State private var photoItems: [PhotosPickerItem] = []
+    #endif
+
+    init(model: AppModel, onAutomaticImport: @escaping () -> Void = {}) {
+        self.model = model
+        self.onAutomaticImport = onAutomaticImport
+    }
 
     var body: some View {
         let tints = CategoryTints(names: model.ledger?.knownCategoryNames ?? [])
@@ -36,12 +50,22 @@ struct TransactionListView: View {
         #else
         .listStyle(.insetGrouped)
         #endif
+        .refreshable {
+            await model.refreshLedger()
+        }
         .navigationTitle("流水")
         .searchable(text: Bindable(model).searchText, prompt: "商户或分类")
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
-                Button("手动记账", systemImage: "plus") {
-                    model.beginManualTransaction()
+                Menu {
+                    Button("手动输入", systemImage: "square.and.pencil") {
+                        model.beginManualTransaction()
+                    }
+                    Button("自动解析", systemImage: "doc.viewfinder") {
+                        isChoosingImages = true
+                    }
+                } label: {
+                    Label("添加记录", systemImage: "plus")
                 }
                 Button("筛选", systemImage: "line.3.horizontal.decrease.circle") {
                     isShowingFilters = true
@@ -51,6 +75,40 @@ struct TransactionListView: View {
             }
         }
         .sheet(isPresented: $isShowingFilters) { FilterView(model: model) }
+        #if os(iOS)
+        .photosPicker(
+            isPresented: $isChoosingImages,
+            selection: $photoItems,
+            maxSelectionCount: 20,
+            selectionBehavior: .ordered,
+            matching: .images
+        )
+        .onChange(of: photoItems) { _, items in
+            Task {
+                var images: [Data] = []
+                for item in items {
+                    if let data = try? await item.loadTransferable(type: Data.self) {
+                        images.append(data)
+                    }
+                }
+                photoItems.removeAll()
+                beginAutomaticImport(with: images)
+            }
+        }
+        #else
+        .fileImporter(
+            isPresented: $isChoosingImages,
+            allowedContentTypes: [.image],
+            allowsMultipleSelection: true
+        ) { result in
+            switch result {
+            case .success(let urls):
+                beginAutomaticImport(with: urls.compactMap(loadImageData))
+            case .failure(let error):
+                model.present(error)
+            }
+        }
+        #endif
         .overlay {
             if model.visibleTransactions.isEmpty {
                 if hasActiveFilters || !model.searchText.isEmpty {
@@ -91,6 +149,24 @@ struct TransactionListView: View {
         model.typeFilter = nil
         model.categoryFilter = nil
     }
+
+    private func beginAutomaticImport(with images: [Data]) {
+        guard !images.isEmpty else { return }
+        model.importImages(images)
+        onAutomaticImport()
+    }
+
+    #if os(macOS)
+    private func loadImageData(from url: URL) -> Data? {
+        let hasAccess = url.startAccessingSecurityScopedResource()
+        defer {
+            if hasAccess {
+                url.stopAccessingSecurityScopedResource()
+            }
+        }
+        return try? Data(contentsOf: url)
+    }
+    #endif
 }
 
 #if DEBUG

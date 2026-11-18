@@ -3,16 +3,35 @@ import UniformTypeIdentifiers
 
 struct ContentView: View {
     @State private var model = AppModel()
+    @State private var shouldOpenImport = false
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         Group {
             if model.ledger == nil {
                 LedgerSelectionView(model: model)
             } else {
-                MainLedgerView(model: model)
+                MainLedgerView(model: model, shouldOpenImport: $shouldOpenImport)
             }
         }
-        .task { await model.restoreLedger() }
+        .task {
+            await model.restoreLedger()
+            consumeSharedImagesIfPossible()
+        }
+        .onOpenURL { url in
+            guard url.scheme == SharedImportInbox.deepLinkScheme else { return }
+            consumeSharedImagesIfPossible()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active {
+                consumeSharedImagesIfPossible()
+            }
+        }
+        .onChange(of: model.ledger != nil) { _, hasLedger in
+            if hasLedger {
+                consumeSharedImagesIfPossible()
+            }
+        }
         .alert("提示", isPresented: Binding(
             get: { model.errorMessage != nil },
             set: { if !$0 { model.errorMessage = nil } }
@@ -22,12 +41,20 @@ struct ContentView: View {
             Text(model.errorMessage ?? "")
         }
     }
+
+    private func consumeSharedImagesIfPossible() {
+        guard model.ledger != nil else { return }
+        let images = SharedImportInbox.consumePendingImages()
+        guard !images.isEmpty else { return }
+        model.importImages(images)
+        shouldOpenImport = true
+    }
 }
 
 #if DEBUG
 #Preview("完整账本") {
     @Previewable @State var model = PreviewData.appModel()
-    MainLedgerView(model: model)
+    MainLedgerView(model: model, shouldOpenImport: .constant(false))
 }
 #endif
 
@@ -114,8 +141,11 @@ struct LedgerSelectionView: View {
 
 struct MainLedgerView: View {
     let model: AppModel
+    @Binding var shouldOpenImport: Bool
     #if os(macOS)
     @State private var selectedSection: LedgerSection? = .transactions
+    #else
+    @State private var selectedSection: MobileLedgerSection = .transactions
     #endif
 
     var body: some View {
@@ -128,7 +158,11 @@ struct MainLedgerView: View {
             NavigationStack {
                 switch selectedSection ?? .transactions {
                 case .transactions:
-                    TransactionListView(model: model)
+                    TransactionListView(model: model) {
+                        if selectedSection != .importImages {
+                            selectedSection = .importImages
+                        }
+                    }
                 case .importImages:
                     ImportView(model: model)
                 case .statistics:
@@ -143,21 +177,43 @@ struct MainLedgerView: View {
         .sheet(item: $model.selectedTransaction) { transaction in
             transactionConfirmation(for: transaction)
         }
+        .task(id: shouldOpenImport) {
+            routeToSharedImportIfNeeded()
+        }
         #else
-        TabView {
-            NavigationStack { TransactionListView(model: model) }
+        TabView(selection: $selectedSection) {
+            NavigationStack {
+                TransactionListView(model: model) {
+                    if selectedSection != .importImages {
+                        selectedSection = .importImages
+                    }
+                }
+            }
                 .tabItem { Label("流水", systemImage: "list.bullet.rectangle") }
+                .tag(MobileLedgerSection.transactions)
             NavigationStack { ImportView(model: model) }
                 .tabItem { Label("导入", systemImage: "doc.viewfinder") }
+                .tag(MobileLedgerSection.importImages)
             NavigationStack { StatisticsView(model: model) }
                 .tabItem { Label("统计", systemImage: "chart.bar") }
+                .tag(MobileLedgerSection.statistics)
             NavigationStack { SettingsView(model: model) }
                 .tabItem { Label("设置", systemImage: "gearshape") }
+                .tag(MobileLedgerSection.settings)
         }
         .sheet(item: $model.selectedTransaction) { transaction in
             transactionConfirmation(for: transaction)
         }
+        .task(id: shouldOpenImport) {
+            routeToSharedImportIfNeeded()
+        }
         #endif
+    }
+
+    private func routeToSharedImportIfNeeded() {
+        guard shouldOpenImport else { return }
+        selectedSection = .importImages
+        shouldOpenImport = false
     }
 
     private func transactionConfirmation(for transaction: LedgerTransaction) -> some View {
@@ -184,6 +240,15 @@ struct MainLedgerView: View {
         )
     }
 }
+
+#if os(iOS)
+private enum MobileLedgerSection: Hashable {
+    case transactions
+    case importImages
+    case statistics
+    case settings
+}
+#endif
 
 #if os(macOS)
 private enum LedgerSection: String, CaseIterable, Identifiable {
@@ -247,5 +312,6 @@ private struct LedgerSidebar: View {
         }
         .navigationTitle("截图账本")
     }
+
 }
 #endif

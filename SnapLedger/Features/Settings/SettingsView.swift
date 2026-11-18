@@ -42,7 +42,7 @@ struct SettingsView: View {
             }
 
             Section {
-                TextEditor(text: $recognitionGuidance)
+                IMESafeTextEditor(text: $recognitionGuidance)
                     .frame(minHeight: 110)
                     .focused($isRecognitionGuidanceFocused)
                 Button("保存识别偏好") {
@@ -158,7 +158,7 @@ private struct MacSettingsContent: View {
                 }
 
                 MacSettingsSection(title: "识别偏好", systemImage: "text.badge.checkmark") {
-                    TextEditor(text: $recognitionGuidance)
+                    IMESafeTextEditor(text: $recognitionGuidance)
                         .font(.body)
                         .scrollContentBackground(.hidden)
                         .padding(10)
@@ -300,7 +300,7 @@ private struct CategoryEditView: View {
     let onSave: (LedgerCategory) -> Void
     @Environment(\.dismiss) private var dismiss
 
-    private let symbols = ["fork.knife", "cup.and.saucer.fill", "car.fill", "bag.fill", "house.fill", "airplane", "cross.case.fill", "gamecontroller.fill", "book.fill", "gift.fill", "banknote.fill", "tag.fill"]
+    private let symbolGroups = CategorySymbolGroup.defaults
 
     init(category: LedgerCategory, onSave: @escaping (LedgerCategory) -> Void) {
         _category = State(initialValue: category)
@@ -326,7 +326,7 @@ private struct CategoryEditView: View {
                 }
 
                 Section("图标") {
-                    SymbolPickerGrid(symbols: symbols, selection: $category.symbolName)
+                    SymbolPickerGrid(groups: symbolGroups, selection: $category.symbolName)
                 }
 
                 Section {
@@ -357,37 +357,96 @@ private struct CategoryEditView: View {
 }
 
 private struct SymbolPickerGrid: View {
-    let symbols: [String]
+    let groups: [CategorySymbolGroup]
     @Binding var selection: String
 
     private let columns = Array(repeating: GridItem(.flexible(), spacing: 12), count: 4)
 
     var body: some View {
-        LazyVGrid(columns: columns, spacing: 12) {
-            ForEach(symbols, id: \.self) { symbol in
-                Button {
-                    selection = symbol
-                } label: {
-                    Image(systemName: symbol)
-                        .font(.title3)
-                        .frame(maxWidth: .infinity, minHeight: 42)
-                        .foregroundStyle(selection == symbol ? Color.accentColor : .secondary)
-                        .background(
-                            selection == symbol ? Color.accentColor.opacity(0.12) : Color.clear,
-                            in: RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        )
-                        .overlay {
-                            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                .stroke(selection == symbol ? Color.accentColor : .clear, lineWidth: 1.5)
+        VStack(alignment: .leading, spacing: 18) {
+            ForEach(groups) { group in
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(group.title)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    LazyVGrid(columns: columns, spacing: 12) {
+                        ForEach(group.symbols, id: \.self) { symbol in
+                            Button {
+                                selection = symbol
+                            } label: {
+                                Image(systemName: symbol)
+                                    .font(.title3)
+                                    .frame(maxWidth: .infinity, minHeight: 42)
+                                    .foregroundStyle(selection == symbol ? Color.accentColor : .secondary)
+                                    .background(
+                                        selection == symbol ? Color.accentColor.opacity(0.12) : Color.clear,
+                                        in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                    )
+                                    .overlay {
+                                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                            .stroke(selection == symbol ? Color.accentColor : .clear, lineWidth: 1.5)
+                                    }
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel(symbol)
+                            .accessibilityAddTraits(selection == symbol ? .isSelected : [])
                         }
+                    }
                 }
-                .buttonStyle(.plain)
-                .accessibilityLabel(symbol)
-                .accessibilityAddTraits(selection == symbol ? .isSelected : [])
             }
         }
         .padding(.vertical, 4)
     }
+}
+
+private struct CategorySymbolGroup: Identifiable {
+    let id: String
+    let title: LocalizedStringResource
+    let symbols: [String]
+
+    static let defaults: [CategorySymbolGroup] = [
+        .init(
+            id: "food",
+            title: "餐饮",
+            symbols: ["fork.knife", "cup.and.saucer.fill", "takeoutbag.and.cup.and.straw.fill", "birthday.cake.fill", "wineglass.fill", "carrot.fill", "fish.fill", "leaf.fill"]
+        ),
+        .init(
+            id: "shopping",
+            title: "购物",
+            symbols: ["cart.fill", "bag.fill", "basket.fill", "tshirt.fill", "shoe.fill", "eyeglasses", "gift.fill", "shippingbox.fill"]
+        ),
+        .init(
+            id: "transport",
+            title: "交通出行",
+            symbols: ["car.fill", "bus.fill", "tram.fill", "airplane", "bicycle", "fuelpump.fill", "parkingsign.circle.fill", "figure.walk"]
+        ),
+        .init(
+            id: "home",
+            title: "居家账单",
+            symbols: ["house.fill", "lightbulb.fill", "bolt.fill", "drop.fill", "flame.fill", "wifi", "phone.fill", "wrench.and.screwdriver.fill"]
+        ),
+        .init(
+            id: "leisure",
+            title: "娱乐生活",
+            symbols: ["gamecontroller.fill", "film.fill", "music.note", "ticket.fill", "book.fill", "camera.fill", "sportscourt.fill", "figure.run"]
+        ),
+        .init(
+            id: "health",
+            title: "医疗健康",
+            symbols: ["cross.case.fill", "heart.fill", "pills.fill", "stethoscope", "bandage.fill", "figure.mind.and.body"]
+        ),
+        .init(
+            id: "finance",
+            title: "财务工作",
+            symbols: ["banknote.fill", "creditcard.fill", "building.columns.fill", "briefcase.fill", "chart.line.uptrend.xyaxis", "wallet.pass.fill", "dollarsign.circle.fill", "percent"]
+        ),
+        .init(
+            id: "other",
+            title: "人物与其他",
+            symbols: ["person.fill", "person.2.fill", "pawprint.fill", "star.fill", "flag.fill", "globe", "location.fill", "calendar", "clock.fill", "tag.fill", "ellipsis.circle.fill"]
+        )
+    ]
 }
 
 struct PaymentMethodManagementView: View {
